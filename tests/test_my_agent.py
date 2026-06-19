@@ -7,6 +7,7 @@ from __future__ import annotations
 import numpy as np
 
 from agent.my_agent import (
+    ReactiveNav,
     ReplaySearch,
     frame_signature,
     grid_from_frame,
@@ -195,3 +196,29 @@ def test_search_still_solves_with_pruning_enabled() -> None:
     cand = {k: ["ACTION1", "ACTION3"] for k in ("r", "a", "b")}
     solved, _a, _r = run_sim(trans, cand)
     assert solved
+
+
+# ───────────────────────────── ReactiveNav ─────────────────────────────
+def test_reactive_nav_probe_detects_cursor_and_direction() -> None:
+    root = np.zeros((8, 8), dtype=np.int16); root[2, 2] = 7
+    result = np.zeros((8, 8), dtype=np.int16); result[2, 3] = 7  # cursor moved right
+    nav = ReactiveNav()
+    nav.probe(root, result, "ACTION4")
+    assert nav.cursor_color == 7
+    assert nav.arrow_map.get("right") == "ACTION4"
+
+
+def test_reactive_nav_moves_toward_target_then_interacts() -> None:
+    nav = ReactiveNav()
+    nav.cursor_color, nav.bg, nav.interact = 7, 0, "ACTION5"
+    nav.arrow_map = {"right": "ACTION4", "left": "ACTION3"}
+    nav.threshold = 1.0
+    grid = np.zeros((8, 8), dtype=np.int16); grid[2, 2] = 7; grid[2, 5] = 9  # target to the right
+    assert nav.next_move(grid) == "ACTION4"
+    nav.threshold = 3.0
+    near = np.zeros((8, 8), dtype=np.int16); near[2, 4] = 7; near[2, 5] = 9  # adjacent → interact
+    assert nav.next_move(near) == "ACTION5"
+
+
+def test_reactive_nav_not_ready_without_two_arrows() -> None:
+    assert ReactiveNav().ready() is False

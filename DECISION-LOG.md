@@ -82,16 +82,23 @@ Newest at the bottom.
       the observed low score; if resets were free, solved levels would score near the cap and the aggregate would be
       ~0.3–1.0. ⇒ resets/exploration ARE counted ⇒ **minimize-first-exposure is correct** (no architecture change).
 
-## NEXT (the real gap to occam's 17/25 — specialized solvers, not more BFS efficiency)
-- [x] ~~Counter detection / action ranking / step_modulus / max_unique_states / give-up~~ — done; efficiency levers
-      are not the coverage lever (above).
-- [ ] **Port occam's SPECIALIZED solvers** — this is where 17/25 comes from, not BFS tuning:
-      `_solve_reactive_navigation` (cursor→target pathfinding for movement games), `_solve_reactive_click`,
-      `_try_navigation_solve` (logical-grid BFS), and the **dense click scan** that finds ALL effective click
-      positions. BFS is occam's *fallback*; the heuristic solvers crack most games efficiently.
-- [ ] Run at the real per-level 5× cutoff (human baselines are 7–152; the grader allows ~5×, so budgets are
-      modest — efficiency matters for SCORE even where coverage is reached).
-- [ ] Cross-level skill reuse (occam's winning-combo short-circuit) so later levels reuse level-1 solutions.
+- 2026-06-19 — **Ported reactive navigation + logical-grid pathfinding** (`ReactiveNav.probe/next_move/plan_path`).
+      Wired as phases BEFORE the BFS fallback: warmup → navprobe → (pathfind → greedy) → bfs, with fast bail-to-BFS
+      on cursor death / stall. **FINDING: they ACTIVATE correctly but solve 0 NEW public games.** Probe detects a
+      cursor + arrow map on ls20/m0r0/sp80/wa30; pathfinding finds BFS routes on ar25/cn04/dc22/ka59/re86/sp80/wa30
+      and interacts on arrival — but the public games' goals are richer than "reach the rarest-color tile + press
+      interact" (mazes with non-obvious goals, sequences, pushing). **No regression: 3/25 holds, fallbacks verified;
+      19/19 tests.** The solvers stay — they'll crack matching simple-movement games on the hidden ~110-game set
+      (occam keeps them for the same reason). A `ARC_DEBUG=1` env var prints nav activation for diagnostics.
+
+## NEXT (to occam's 17/25 — goal inference + the rest of occam's pipeline)
+- [ ] **Goal inference** is the real blocker: "rarest-color tile" is the wrong target for most games. Infer the
+      goal from what changes when levels complete, or from reward-shaped exploration, not a color heuristic.
+- [ ] Port occam's remaining solvers: **combo search** (exhaustive short action sequences), **deepcopy BFS**
+      (perfect state cloning, no replay cost), **dense click scan** (find ALL effective click positions),
+      `_solve_reactive_click`, and **cross-level winning-combo caching** (reuse level-1 solutions on later levels).
+- [ ] Run at the real per-level 5× cutoff (human baselines 7–152) — efficiency matters for SCORE where coverage
+      is already reached.
 - [ ] **First-exposure cost vs 5× cutoff:** measure naive solve cost vs the give-up budget on 2–3 public games.
 - [ ] **Offline audit:** grep `agent/my_agent.py` for `requests|urllib|httpx|huggingface_hub|torch.hub|socket`;
       run the notebook with internet disabled locally before submitting.
