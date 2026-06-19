@@ -68,18 +68,30 @@ Newest at the bottom.
 - 2026-06-19 — **OFF ZERO ✓ — first solves.** Coverage scales with budget: 250 steps → **1/25** (vc33);
       800 steps → **3/25** (vc33, lp85, sp80), aggregate RHAE 0.0145. The pipeline genuinely solves now.
 
-## NEXT (close the gap to occam's 17/25 — make reset-replay action-efficient)
-- [x] ~~Per-game counter detection~~ — done (geometric status-bar masking).
-- [x] ~~Priority-tier action ranking~~ — done (`priority_click_targets` + effective-first).
-- [ ] **Action efficiency is now the limiter** (reset-replay re-replays prefixes → burns the budget before reaching
-      deep solutions). Port occam's `step_modulus` state hashing + `max_unique_states` cap + effective-action
-      PRUNING so the per-level budget reaches deeper wins. Highest-leverage next step.
-- [ ] **Per-level give-up budget** (`eval/rhae.giveup_budget`, ≈5× human) wired in so a stuck level stops wasting
-      actions the others need.
-- [ ] Tune the real per-game budget toward the 5× cutoff (human baselines are hundreds; 800 local steps already
-      lifts coverage 1→3).
-- [ ] Re-run the reset-counting experiment now that levels are solvable (vc33/lp85/sp80), to settle the
-      architecture fork empirically.
+- 2026-06-19 — **Ported the efficiency levers** (effective-action PRUNING, `max_unique_states` cap, `step_modulus`
+      depth-keying, per-level give-up budget). **EMPIRICAL FINDING: on the public set they are net-NEGATIVE for
+      COVERAGE.** Dead-simple pruning dropped sp80 (some directional action is effective only in later states);
+      cutting clicks 24→10 dropped vc33+sp80. Coverage (solve rate) needs BROAD exploration; these levers only buy
+      action-efficiency, which the 1.15 cap makes secondary. So all are wired + unit-tested but **defaulted to the
+      coverage-optimal config**: pruning OFF, `step_modulus`=1 (no-op), clicks=24, give-up=MAX_ACTIONS. Coverage
+      held at **3/25 @800 steps (vc33, lp85, sp80), aggregate 0.0145**. 16/16 tests. (occam benefits from pruning
+      only inside its full multi-solver pipeline + dense click scan, not a BFS-only agent.)
+- 2026-06-19 — **RESET-COUNTING RESOLVED: CUMULATIVE ✓.** The agent SOLVES vc33 level 1 (801 actions) yet
+      solved-game RHAE is ~0.01–0.05 (aggregate 0.0145), nowhere near the 1.15 cap. vc33 human baselines =
+      [7, 18, 44, 61, 131, 34, 152] (level 1 = **7** actions!). Only cumulative counting, (7/hundreds)²≈0, matches
+      the observed low score; if resets were free, solved levels would score near the cap and the aggregate would be
+      ~0.3–1.0. ⇒ resets/exploration ARE counted ⇒ **minimize-first-exposure is correct** (no architecture change).
+
+## NEXT (the real gap to occam's 17/25 — specialized solvers, not more BFS efficiency)
+- [x] ~~Counter detection / action ranking / step_modulus / max_unique_states / give-up~~ — done; efficiency levers
+      are not the coverage lever (above).
+- [ ] **Port occam's SPECIALIZED solvers** — this is where 17/25 comes from, not BFS tuning:
+      `_solve_reactive_navigation` (cursor→target pathfinding for movement games), `_solve_reactive_click`,
+      `_try_navigation_solve` (logical-grid BFS), and the **dense click scan** that finds ALL effective click
+      positions. BFS is occam's *fallback*; the heuristic solvers crack most games efficiently.
+- [ ] Run at the real per-level 5× cutoff (human baselines are 7–152; the grader allows ~5×, so budgets are
+      modest — efficiency matters for SCORE even where coverage is reached).
+- [ ] Cross-level skill reuse (occam's winning-combo short-circuit) so later levels reuse level-1 solutions.
 - [ ] **First-exposure cost vs 5× cutoff:** measure naive solve cost vs the give-up budget on 2–3 public games.
 - [ ] **Offline audit:** grep `agent/my_agent.py` for `requests|urllib|httpx|huggingface_hub|torch.hub|socket`;
       run the notebook with internet disabled locally before submitting.

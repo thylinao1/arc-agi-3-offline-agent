@@ -163,3 +163,35 @@ def test_start_level_resets_state() -> None:
     s.step("r", ["ACTION1"])
     s.start_level("root2", ["ACTION1", "ACTION2"])
     assert s.root == "root2" and s.known == {"root2": []} and s.terminal == set()
+
+
+def test_step_modulus_keys_by_depth() -> None:
+    s = ReplaySearch(step_modulus=2)
+    s._pending_depth = 0
+    assert s._key("abc") == "abc#0"
+    s._pending_depth = 3
+    assert s._key("abc") == "abc#1"
+    assert ReplaySearch()._key("abc") == "abc"  # default (mod=1) is a no-op
+
+
+def test_dead_simple_pruning_when_enabled() -> None:
+    s = ReplaySearch(prune_dead_simples=True)
+    for _ in range(s.DEAD_AFTER):
+        s._record_simple("ACTION3", changed=False)
+    assert s._dead("ACTION3") is True            # ineffective simple is pruned
+    s._record_simple("ACTION1", changed=True)
+    assert s._dead("ACTION1") is False           # effective simple kept
+    assert s._dead("ACTION6:1,2") is False       # clicks are never globally pruned
+    assert ReplaySearch()._dead("ACTION3") is False  # default OFF (coverage-first)
+
+
+def test_search_still_solves_with_pruning_enabled() -> None:
+    # ACTION3 is a global no-op (ineffective everywhere); the win needs ACTION1 x3.
+    trans = {
+        ("r", "ACTION1"): ("a", "normal"), ("r", "ACTION3"): ("r", "normal"),
+        ("a", "ACTION1"): ("b", "normal"), ("a", "ACTION3"): ("a", "normal"),
+        ("b", "ACTION1"): ("g", "win"), ("b", "ACTION3"): ("b", "normal"),
+    }
+    cand = {k: ["ACTION1", "ACTION3"] for k in ("r", "a", "b")}
+    solved, _a, _r = run_sim(trans, cand)
+    assert solved

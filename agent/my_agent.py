@@ -229,77 +229,126 @@ class ReplaySearch:
     state's untried tokens (effective ones first) before moving to the next discovered
     state, so shallow wins are found early. Repositioning to a target replays its prefix,
     incrementally when the current state is an ancestor, else RESET + full replay.
+
+    Efficiency (occam-ported):
+      - Effective-action pruning: a simple action proven ineffective from several states is
+        dropped globally, shrinking the branching factor (clicks stay per-state).
+      - max_unique_states: stop enqueuing new states past a cap (memory/runaway guard).
+      - step_modulus: when > 1, the node key is augmented with (depth % step_modulus) so a
+        same-looking frame at a different phase of a cycle is a distinct state. Default 1
+        (no-op) — it needs per-game periodicity to help, so it is off unless set.
     """
 
-    def __init__(self) -> None:
+    DEAD_AFTER = 3  # ineffective probes from distinct states before a simple is pruned
+
+    def __init__(
+        self,
+        step_modulus: int = 1,
+        max_unique_states: int = 200_000,
+        prune_dead_simples: bool = False,
+    ) -> None:
+        # NOTE: prune_dead_simples defaults OFF. Empirically (the public-set sweep) global
+        # simple-action pruning costs COVERAGE — some directional actions are effective only
+        # in later states, and coverage (solve rate) is the primary objective. The lever is
+        # kept for games/configs where action-efficiency matters more than coverage.
+        self.step_modulus = max(1, int(step_modulus))
+        self.max_states = max_unique_states
+        self.prune_dead_simples = prune_dead_simples
         self.effective: set[str] = set()
+        self.simple_tries: dict[str, int] = {}
+        self.simple_effects: dict[str, int] = {}
         self.start_level("", [])
         self.root = None  # type: Optional[str]
 
     def start_level(self, sig: str, candidates: list[str]) -> None:
-        self.root = sig or None
-        self.known: dict[str, list[str]] = {sig: []} if sig else {}
-        self.by_prefix: dict[tuple[str, ...], str] = {(): sig} if sig else {}
-        self.cand: dict[str, list[str]] = {sig: list(candidates)} if sig else {}
+        self._pending_depth = 0
+        key = self._key(sig) if sig else sig
+        self.root = key or None
+        self.known: dict[str, list[str]] = {key: []} if sig else {}
+        self.cand: dict[str, list[str]] = {key: list(candidates)} if sig else {}
         self.tried: dict[str, set[str]] = {}
         self.terminal: set[str] = set()
-        self.queue: list[str] = [sig] if sig else []
+        self.queue: list[str] = [key] if sig else []
         self.qi = 0
-        self.expanding: Optional[str] = sig or None
+        self.expanding: Optional[str] = key or None
         self.plan: list[str] = []
         self.awaiting: Optional[tuple[str, str]] = None
-        self.cur: Optional[str] = sig or None
+        self.cur: Optional[str] = key or None
 
     def note_reset(self) -> None:
         self.plan = []
         self.awaiting = None
         self.cur = None
+        self._pending_depth = 0
+
+    def _key(self, base: str) -> str:
+        if self.step_modulus <= 1:
+            return base
+        return f"{base}#{self._pending_depth % self.step_modulus}"
+
+    def _dead(self, tok: str) -> bool:
+        if not self.prune_dead_simples or tok.startswith("ACTION6:"):
+            return False
+        return self.simple_tries.get(tok, 0) >= self.DEAD_AFTER and self.simple_effects.get(tok, 0) == 0
 
     def step(self, sig: str, candidates: list[str], game_over: bool = False) -> str:
         if self.root is None:
             self.start_level(sig, candidates)
             return self._next()
 
+        key = self._key(sig)
+
         if game_over:
             if self.awaiting is not None:
                 e, t = self.awaiting
-                if sig not in self.known:
-                    self.known[sig] = self.known[e] + [t]
-                    self.by_prefix[tuple(self.known[sig])] = sig
-                self.terminal.add(sig)
+                if key not in self.known:
+                    self.known[key] = self.known[e] + [t]
+                self.terminal.add(key)
+                self._record_simple(t, changed=True)  # death is a state change
                 self.awaiting = None
             self.plan = []
             self.cur = None
+            self._pending_depth = 0
             return RESET
 
         if self.awaiting is not None:
             e, t = self.awaiting
-            if sig not in self.known:
-                self.known[sig] = self.known[e] + [t]
-                self.by_prefix[tuple(self.known[sig])] = sig
-                self.cand[sig] = list(candidates)
-                self.queue.append(sig)  # BFS: enqueue, do NOT descend immediately
-            if sig != e:
+            changed = key != e
+            if key not in self.known:
+                self.known[key] = self.known[e] + [t]
+                self.cand[key] = list(candidates)
+                if len(self.known) <= self.max_states:
+                    self.queue.append(key)
+            if changed:
                 self.effective.add(t)
+            self._record_simple(t, changed)
             self.awaiting = None
-            self.cur = sig
+            self.cur = key
         else:
-            self.cur = sig
-            self.cand.setdefault(sig, list(candidates))
+            self.cur = key
+            self.cand.setdefault(key, list(candidates))
 
         if self.plan:
             return self._emit()
         return self._next()
 
+    def _record_simple(self, tok: str, changed: bool) -> None:
+        if tok.startswith("ACTION6:"):
+            return
+        self.simple_tries[tok] = self.simple_tries.get(tok, 0) + 1
+        if changed:
+            self.simple_effects[tok] = self.simple_effects.get(tok, 0) + 1
+
     def _emit(self) -> str:
         tok = self.plan.pop(0)
         if not self.plan and self.expanding is not None:
             self.awaiting = (self.expanding, tok)
+        self._pending_depth = 0 if tok == RESET else self._pending_depth + 1
         return tok
 
     def _untried(self, sig: str) -> list[str]:
         done = self.tried.setdefault(sig, set())
-        ut = [c for c in self.cand.get(sig, []) if c not in done]
+        ut = [c for c in self.cand.get(sig, []) if c not in done and not self._dead(c)]
         return [c for c in ut if c in self.effective] + [c for c in ut if c not in self.effective]
 
     def _next(self) -> str:
@@ -309,6 +358,7 @@ class ReplaySearch:
             self.qi += 1
             if self.qi >= len(self.queue):
                 self.expanding = None
+                self._pending_depth = 0
                 return RESET
             self.expanding = self.queue[self.qi]
 
@@ -330,6 +380,9 @@ class MyAgent(Agent):  # type: ignore[misc]
 
     MAX_ACTIONS = 1000
     WARMUP_STEPS = 8
+    CLICK_BUDGET = 24          # salient click targets per state (coverage > branching savings)
+    GIVEUP_PER_LEVEL = 1000    # stop burning actions on a stuck level (≈ the grader's 5x cutoff)
+    STEP_MODULUS = 1           # >1 only for known-periodic games (per-game lever, off by default)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -337,10 +390,11 @@ class MyAgent(Agent):  # type: ignore[misc]
         self._reset_level()
 
     def _reset_level(self) -> None:
-        self._search = ReplaySearch()
+        self._search = ReplaySearch(step_modulus=self.STEP_MODULUS)
         self._mask: Optional[np.ndarray] = None
         self._warm: list[np.ndarray] = []
         self._frozen = False
+        self._level_actions = 0
 
     @property
     def name(self) -> str:
@@ -358,6 +412,11 @@ class MyAgent(Agent):  # type: ignore[misc]
         if latest_frame.levels_completed > self._level:
             self._level = latest_frame.levels_completed
             self._reset_level()
+
+        # Per-level give-up: once a level has burned its budget, stop wasting actions on it.
+        self._level_actions += 1
+        if self._level_actions > self.GIVEUP_PER_LEVEL:
+            return GameAction.RESET
 
         grid = grid_from_frame(latest_frame.frame)
 
@@ -398,7 +457,11 @@ class MyAgent(Agent):  # type: ignore[misc]
             else:
                 simple.append(a.name)
         simple.sort()
-        clicks = [f"ACTION6:{x},{y}" for (x, y) in priority_click_targets(grid)] if has_click else []
+        clicks = (
+            [f"ACTION6:{x},{y}" for (x, y) in priority_click_targets(grid, self.CLICK_BUDGET)]
+            if has_click
+            else []
+        )
         return simple + clicks
 
     def _to_action(self, token: str) -> Any:

@@ -1,27 +1,25 @@
-"""Day-1 GO/NO-GO experiment: how does a LEVEL RESET affect the scored action count?
+"""Reset-counting experiment (conclusive version).
 
-THE question that forks the architecture (see DECISION-LOG.md):
-  - If the grader scores only the BEST / LAST attempt → explore-then-replay is allowed.
-  - If it counts CUMULATIVE actions across resets → minimize first-exposure (the default).
+THE question that forks the architecture (see DECISION-LOG.md): does the grader's per-level
+action count reflect only the successful path, or does it count ALL actions on first
+exposure (exploration + resets + replays)?
 
-This script drives one game two ways and dumps the scorecard so you can compare what the
-grader actually counts. The TRUE answer requires ONLINE mode (set ARC_API_KEY in .env) so
-you read the real three.arcprize.org scorecard. Locally (NORMAL) it shows the SDK's own
-accounting, which is a strong hint but not the authoritative grader.
+Now that the agent actually SOLVES some games (vc33/lp85/sp80) — and it solves them via
+reset-and-replay, which spends MANY actions resetting and replaying before the win — we can
+answer it directly. Run the real agent on a solvable game and read the scorecard's per-level
+`level_actions` for the solved level:
 
-    python experiments/reset_counting.py --game ls20
+  - If level_actions ≈ total actions taken (hundreds, incl. resets) → CUMULATIVE: exploration
+    is paid for; minimize first-exposure (occam's model, our current design).
+  - If level_actions ≈ the short human-comparable path → resets are NOT counted; explore-then-
+    replay is "free" and we should switch strategy.
 
-What to compare in the printed scorecards:
-  A) "clean" run: N actions, no extra resets.
-  B) "wasteful" run: ~30 throwaway actions, a RESET, then the same N actions.
-  If B's reported per-level action count ≈ N  → reset zeros/best-selects → enable replay.
-  If B's reported count ≈ 30 + N            → cumulative            → minimize-first-exposure.
+    python experiments/reset_counting.py --game vc33
 """
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -31,62 +29,62 @@ sys.path.insert(0, str(ROOT / "vendor" / "ARC-AGI-3-Agents"))
 
 import arc_agi  # noqa: E402
 from arc_agi import OperationMode  # noqa: E402
-from arcengine import GameAction, GameState  # noqa: E402
 
-from agents.agent import Agent  # noqa: E402
-
-
-class _ScriptedAgent(Agent):
-    SCRIPT: list[str] = []
-    MAX_ACTIONS = 10_000
-
-    def is_done(self, frames, latest_frame) -> bool:
-        return self.action_counter >= len(self.SCRIPT) or latest_frame.state is GameState.WIN
-
-    def choose_action(self, frames, latest_frame):
-        if latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER):
-            return GameAction.RESET
-        return GameAction.from_name(self.SCRIPT[self.action_counter])
-
-
-def drive(arc, game_id: str, script: list[str], label: str) -> int:
-    env = arc.make(game_id)
-    _ScriptedAgent.SCRIPT = script
-    a = _ScriptedAgent(
-        card_id=f"exp-{label}", game_id=game_id, agent_name=f"reset-{label}",
-        ROOT_URL="http://localhost", record=False, arc_env=env, tags=["exp", label],
-    )
-    a.main()
-    print(f"[{label}] action_counter={a.action_counter} "
-          f"levels_completed={a.frames[-1].levels_completed} state={a.frames[-1].state}")
-    return a.action_counter
+from agent.my_agent import MyAgent  # noqa: E402
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--game", default="ls20")
+    p.add_argument("--game", default="vc33")
+    p.add_argument("--max-steps", type=int, default=800)
     args = p.parse_args()
 
-    if not os.getenv("ARC_API_KEY"):
-        print("NOTE: ARC_API_KEY not set — running NORMAL/local. The SDK scorecard below is a "
-              "hint, not the authoritative grader. Re-run ONLINE for the real answer.\n")
-
-    cycle = ["ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5"]
-    base = [cycle[i % len(cycle)] for i in range(20)]
-    clean = ["RESET"] + base
-    wasteful = ["RESET"] + cycle * 6 + ["RESET"] + base  # waste, reset, then the same base
-
     arc = arc_agi.Arcade(operation_mode=OperationMode.NORMAL)
-    drive(arc, args.game, clean, "clean")
-    drive(arc, args.game, wasteful, "wasteful")
+    env = arc.make(args.game)
+    MyAgent.MAX_ACTIONS = args.max_steps
+    agent = MyAgent(
+        card_id="reset-exp", game_id=args.game, agent_name=f"MyAgent.{args.game}",
+        ROOT_URL="http://localhost", record=False, arc_env=env, tags=["reset-exp"],
+    )
+    agent.main()
+
+    final = agent.frames[-1]
+    print(f"\nagent: total actions taken = {agent.action_counter}, "
+          f"levels_completed = {final.levels_completed}, state = {final.state}")
 
     sc = arc.get_scorecard()
-    print("\n=== scorecard ===")
-    try:
-        print(json.dumps(sc.model_dump() if hasattr(sc, "model_dump") else sc, indent=2, default=str))
-    except Exception:
-        print(repr(sc))
-    print("\nCompare the per-level action counts for clean vs wasteful (see module docstring).")
+    data = sc.model_dump() if hasattr(sc, "model_dump") else sc
+    cards = data.get("cards", []) if isinstance(data, dict) else []
+    # Per-card game_id is null (cards are keyed by guid); pick the one with real level data.
+    card = next((c for c in cards if c.get("level_baseline_actions")), None)
+    if card is None and cards:
+        card = cards[0]
+    if card is None:
+        print("No scorecard card found.")
+        print(json.dumps(data, indent=2, default=str)[:1500])
+        return
+
+    print("\n=== scorecard card (the grader's accounting) ===")
+    for k in ("actions", "resets", "levels_completed", "level_count",
+              "level_actions", "level_baseline_actions", "level_scores", "score"):
+        if k in card:
+            print(f"  {k}: {card[k]}")
+
+    la = card.get("level_actions") or []
+    base = card.get("level_baseline_actions") or []
+    print("\n=== verdict ===")
+    if la and any(la):
+        solved_costs = [a for a in la if a]
+        print(f"  per-level actions recorded: {la}")
+        print(f"  human baselines:            {base}")
+        if max(solved_costs) > 50:
+            print("  → level_actions are LARGE (incl. resets/replays) ⇒ CUMULATIVE counting.")
+            print("    Exploration is paid for; minimize-first-exposure is correct (current design).")
+        else:
+            print("  → level_actions are SMALL (≈ solution path only) ⇒ resets NOT counted.")
+            print("    Explore-then-replay is 'free'; consider switching strategy.")
+    else:
+        print("  No per-level action data (game not solved within budget). Try --game lp85/sp80.")
 
 
 if __name__ == "__main__":
