@@ -48,11 +48,26 @@ pytest -q           # unit tests (offline, deterministic)
 Online scorecards and the full game set need an API key from https://three.arcprize.org. Put it in `.env` as
 `ARC_API_KEY`. Submit to Kaggle with `make submit` (edit `notebooks/kernel-metadata.json` first).
 
+## How it solves (hybrid)
+
+`MyAgent.main()` runs a two-stage, fully-offline, deterministic solver:
+
+1. **occam** (`agent/occam_bundle.py`) — Sean Donahoe's MIT, $0, no-LLM reset-replay solver. It wins the
+   cursor/movement games (~7 of the 25 public games). Its headline 17/25 relies on deepcopy-BFS to search the
+   environment for free, which is impossible against the Kaggle gateway (every probe is a counted action), so we
+   run it with `skip_deepcopy=True` — the portable ~7/25 configuration.
+2. **Step-wise fallback** — if occam solves nothing, the built-in symbolic agent (perception → nav → goal
+   hypotheses → clickscan/combosearch → BFS) runs. It wins a couple of non-movement games occam-portable misses.
+
+Net portable coverage is about **9/25**, three times the step-wise agent alone. The agent is always offline-safe:
+any occam error falls back to the step-wise solver. The bundle is regenerated with `python scripts/bundle_occam.py`
+and shipped to Kaggle by `scripts/build_notebook.py`.
+
 ## Status
 
-First cut: a deterministic frontier explorer with centroid-restricted clicking and level-aware budgeting. The next
-step is porting occam's reset-and-replay search. See `DECISION-LOG.md` and `HACKATHON-BATTLEPLAN.md`.
+Hybrid occam + step-wise agent, ~9/25 public games, fully offline and deterministic. See `DECISION-LOG.md` for the
+full design history and the finding that occam's 17/25 does not transfer to the real (no-free-search) competition.
 
 ## License
 
-MIT. See `LICENSE`.
+MIT. See `LICENSE`. This project bundles occam (MIT, Sean Donahoe) — see `NOTICE`.

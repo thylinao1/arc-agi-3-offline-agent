@@ -124,7 +124,29 @@ Newest at the bottom.
       NO game past level 1** — level-1 solutions don't carry to the harder level 2. No regression (0.1021 holds);
       21/21 tests. Kept for hidden-set games with repeated level structure.
 
-## STATUS: bounded heuristics plateaued — 3/25 coverage, 0.1021 RHAE (best), 7× the baseline.
+- 2026-06-19 — **THE BIG LIFT: occam ensemble port → HYBRID agent (3/25 → ~9/25).** Ran a parallel research
+      workflow over occam's source, then ported its full ensemble. Two decisive findings:
+      1. **occam's 17/25 is a LOCAL-ONLY artifact.** It relies on **deepcopy-BFS**, which clones the env to search
+         "for free" (clones don't consume env actions). The real Kaggle competition runs against a GATEWAY where
+         the env can't be deepcopied (every probe is a counted action). With `skip_deepcopy=True` (the
+         Kaggle-portable config), occam solves **7/25** — all movement games (WA30, RE86, KA59, SP80, DC22, M0R0,
+         CN04). So occam's portable ceiling is ~7/25, and ~9/25 is likely near the achievable Kaggle max for any
+         reset-replay agent.
+      2. **My step-wise BFS/combo solves 2 non-movement games occam-portable MISSES** (VC33, LP85).
+      Decision: **HYBRID.** `MyAgent.main()` runs occam's actual orchestrator (MIT, $0, no-LLM) first; if it solves
+      nothing, falls back to the step-wise agent. Coverage = occam's 7 ∪ {VC33, LP85} = **~9/25 (3× the prior
+      3/25)**, always offline-safe (occam error → step-wise fallback).
+- 2026-06-19 — **Kaggle packaging.** occam's `solver/` package (MIT) is flattened into a single self-contained
+      `agent/occam_bundle.py` by `scripts/bundle_occam.py` (so the splice ships it). `_run_occam` loads it via
+      importlib from next to my_agent.py. `build_notebook.py` writes `occam_bundle.py` alongside `my_agent.py` and
+      copies both into the framework on Kaggle. occam's deepcopy code is in the bundle but NEVER executed
+      (`skip_deepcopy=True`) → no PicklingError on the gateway. Attribution: `NOTICE` + bundle header.
+
+## STATUS: HYBRID agent — ~9/25 coverage (occam 7 movement + step-wise VC33/LP85), Kaggle-portable.
+Reset-replay agents appear capped near here on the real (gateway, no-free-search) competition; occam's headline
+17/25 does not transfer. Remaining frontier is genuine research (goal inference under the action-cost constraint).
+
+## (earlier) bounded step-wise heuristics plateaued at 3/25 / 0.1021 RHAE.
 **Evidence-backed ceiling:** five consecutive levers (efficiency levers, reactive nav, pathfinding, collect-all,
 combo caching) each added **0 public coverage/depth**; the budget diagnostic shows it's not a budget problem. The
 public games' goals are genuinely beyond reach/collect/sequence-reuse, and the only in-game signal is the grid +

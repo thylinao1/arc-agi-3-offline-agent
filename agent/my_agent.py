@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import os
 from collections import deque
+from itertools import product
 from typing import Any, Optional
 
 import numpy as np
@@ -570,6 +571,16 @@ class MyAgent(Agent):  # type: ignore[misc]
     GIVEUP_PER_LEVEL = 1000    # stop burning actions on a stuck level (≈ the grader's 5x cutoff)
     STEP_MODULUS = 1           # >1 only for known-periodic games (per-game lever, off by default)
     NAV_CAP = 500              # max goal-hypothesis-search steps before falling back to BFS
+    # occam ensemble (Kaggle-portable, reset-replay): clickscan finds effective click positions
+    # for click-puzzle games; combosearch enumerates short simple sequences. Both run only on the
+    # nav-fail branch and terminate into BFS, with tight budgets so they never starve it.
+    DENSE_SCAN_STEP = 8        # coarse grid step for clickscan (catches non-salient clicks)
+    CLICKSCAN_BUDGET = 200     # max actions in the clickscan phase before falling to BFS
+    COMBOSEARCH_CAP = 250      # max actions in combosearch before falling to BFS
+    COMBO_MAX_DEPTH = 6        # iterative-deepening sequence length cap (6^7 explodes past this)
+    COMBO_EXHAUSTIVE_MAX = 6   # only combosearch when effective-simple count is within [1, 6]
+    OCCAM_MAX_ACTIONS = 2000   # per-level search budget for the occam orchestrator (when available)
+    OCCAM_MAX_LEVELS = 40      # assumed upper bound on levels (baselines are hidden at runtime)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -596,6 +607,21 @@ class MyAgent(Agent):  # type: ignore[misc]
         self._hypo_path: Optional[deque[str]] = None
         self._hypo_last = RESET
         self._hypo_target: Optional[int] = None
+        self._has_click = False
+        self._eff_simples: set[str] = set()          # simples that changed the masked frame (from navprobe)
+        # clickscan state
+        self._cs_seq: deque[str] = deque()
+        self._cs_last: Optional[str] = RESET
+        self._cs_root_sig: Optional[str] = None
+        self._cs_seen: set[str] = set()
+        self._eff_clicks: Optional[list[tuple[int, int]]] = None  # discovered effective click positions
+        self._cs_actions = 0
+        # combosearch state
+        self._combo_simples: list[str] = []
+        self._combo_depth = 1
+        self._combo_iter: Any = None
+        self._combo_plan: deque[str] = deque()
+        self._combo_actions = 0
         # Cross-level reuse: replay the prior level's winning combo first (occam short-circuit).
         self._combo_q: deque = deque(self._winning_combo) if self._winning_combo else deque()
         if self._winning_combo:
@@ -607,6 +633,72 @@ class MyAgent(Agent):  # type: ignore[misc]
 
     def is_done(self, frames: list[Any], latest_frame: Any) -> bool:
         return latest_frame.state is GameState.WIN
+
+    def main(self) -> None:
+        """Play one game with a HYBRID solver (best Kaggle-portable coverage we can reach):
+          1. occam's algorithmic solver (MIT, $0, reset-replay, no LLM) — wins the movement
+             games (~7/25). NB: occam's headline 17/25 relies on deepcopy-BFS to search the env
+             for free, which is impossible against the Kaggle gateway (every probe is a counted
+             action), so the portable ceiling is ~7/25.
+          2. If occam solves nothing, fall back to the built-in step-wise agent, which wins a
+             couple of non-movement games occam-portable misses (VC33, LP85).
+        Net portable coverage ≈ 9/25. Always offline-safe: any occam failure → the step-wise agent."""
+        occam_solved = False
+        try:
+            occam_solved = self._run_occam()
+        except Exception as exc:  # import missing / env mismatch / runtime → safe fallback
+            if _DEBUG:
+                print(f"[occam] {self.game_id}: error, fallback to step-wise ({exc!r})", flush=True)
+        if occam_solved:
+            self.cleanup()
+        else:
+            try:
+                self.arc_env.reset()  # clean root after occam, before the step-wise fallback
+            except Exception:
+                pass
+            super().main()  # framework per-step loop drives the step-wise agent
+
+    def _run_occam(self) -> bool:
+        """Run occam's orchestrator on this game. Returns True iff it completed ≥1 level."""
+        import asyncio
+        import importlib.util
+        import sys
+        from pathlib import Path
+
+        here = Path(__file__).resolve().parent
+        bundle = here / "occam_bundle.py"
+        if bundle.exists():
+            # Self-contained flattened occam (what ships to Kaggle). sys.modules set first so
+            # the bundle's @dataclass introspection resolves under importlib.
+            spec = importlib.util.spec_from_file_location("occam_bundle", bundle)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["occam_bundle"] = mod
+            spec.loader.exec_module(mod)  # type: ignore[union-attr]
+            GameOrchestrator = mod.GameOrchestrator
+            ArcEnvAdapter = mod.ArcEnvAdapter
+        else:
+            # Dev fallback: the vendored occam package.
+            vendored = here.parents[0] / "vendor" / "occam"
+            if vendored.exists() and str(vendored) not in sys.path:
+                sys.path.insert(0, str(vendored))
+            from solver.environments import ArcEnvAdapter  # type: ignore
+            from solver.orchestrator import GameOrchestrator  # type: ignore
+
+        # skip_deepcopy: deepcopy-BFS clones the env, impossible against the Kaggle gateway.
+        orch = GameOrchestrator(max_actions_per_level=self.OCCAM_MAX_ACTIONS, skip_deepcopy=True)
+        env = ArcEnvAdapter(self.arc_env)
+        # Size occam's level loop to the real level count (FrameData.win_levels) so it does not
+        # over-run a won game (which would replay it and tank the RHAE).
+        try:
+            n_levels = int(getattr(self.arc_env.reset(), "win_levels", 0)) or self.OCCAM_MAX_LEVELS
+        except Exception:
+            n_levels = self.OCCAM_MAX_LEVELS
+        n_levels = max(1, min(n_levels, self.OCCAM_MAX_LEVELS))
+        result = asyncio.run(orch.play_game(env, [self.OCCAM_MAX_ACTIONS] * n_levels))
+        won = bool(result.get("levels_completed", 0)) if isinstance(result, dict) else False
+        if _DEBUG:
+            print(f"[occam] {self.game_id}: levels={result.get('levels_completed') if isinstance(result, dict) else '?'}", flush=True)
+        return won
 
     def choose_action(self, frames: list[Any], latest_frame: Any) -> Any:
         action = self._decide(frames, latest_frame)
@@ -657,6 +749,10 @@ class MyAgent(Agent):  # type: ignore[misc]
             return self._navprobe_phase(grid, state)
         if self._phase == "navhypo":
             return self._navhypo_phase(grid, state)
+        if self._phase == "clickscan":
+            return self._clickscan_phase(grid, state)
+        if self._phase == "combosearch":
+            return self._combosearch_phase(grid, state)
 
         sig = frame_signature(grid, self._mask)
         candidates = self._candidates(latest_frame, grid)
@@ -685,7 +781,9 @@ class MyAgent(Agent):  # type: ignore[misc]
             simples = [t for t in self._candidates(latest_frame, grid) if not t.startswith("ACTION6:")]
             return self._to_action(simples[len(self._warm) % len(simples)]) if simples else GameAction.RESET
         self._mask = combine_masks(status_bar_mask(grid), volatility_mask(self._warm))
-        self._simples = [t for t in self._candidates(latest_frame, grid) if not t.startswith("ACTION6:")]
+        cands = self._candidates(latest_frame, grid)
+        self._simples = [t for t in cands if not t.startswith("ACTION6:")]
+        self._has_click = any(t.startswith("ACTION6:") for t in cands)
         seq: list[str] = []
         for i, a in enumerate(self._simples):  # probe each simple from root: [a1, RESET, a2, RESET, ...]
             seq.append(a)
@@ -700,8 +798,13 @@ class MyAgent(Agent):  # type: ignore[misc]
     def _navprobe_phase(self, grid: np.ndarray, state: Any) -> Any:
         if self._nav_last == RESET:
             self._nav_root = grid
-        elif self._nav_last is not None and state is not GameState.GAME_OVER and self._nav_root is not None:
-            self._nav.probe(self._nav_root, grid, self._nav_last)
+        elif self._nav_last is not None and self._nav_root is not None:
+            if state is not GameState.GAME_OVER:
+                self._nav.probe(self._nav_root, grid, self._nav_last)
+                if frame_signature(grid, self._mask) != frame_signature(self._nav_root, self._mask):
+                    self._eff_simples.add(self._nav_last)  # this simple changes the world
+            else:
+                self._eff_simples.add(self._nav_last)      # caused a state change (death)
         if self._nav_seq:
             self._nav_last = self._nav_seq.popleft()
             return self._to_action(self._nav_last)
@@ -713,18 +816,16 @@ class MyAgent(Agent):  # type: ignore[misc]
                       f"arrows={self._nav.arrow_map} interact={self._nav.interact}", flush=True)
             self._phase = "navhypo"
             self._hypo_last, self._hypo_targets, self._hypo_path, self._nav_steps = RESET, None, None, 0
-        else:
-            if _DEBUG:
-                print(f"[nav] {self.game_id}: no cursor → BFS (arrows={self._nav.arrow_map})", flush=True)
-            self._phase = "bfs"
-            self._search = ReplaySearch(step_modulus=self.STEP_MODULUS)
-        return GameAction.RESET  # clean root start for the next phase
+            return GameAction.RESET  # clean root start for navhypo
+        if _DEBUG:
+            print(f"[nav] {self.game_id}: no cursor → route (eff_simples={sorted(self._eff_simples)})", flush=True)
+        return self._route_after_nav()
 
     # -- phase: goal-hypothesis search — pathfind to each candidate target, interact, test --
     def _navhypo_phase(self, grid: np.ndarray, state: Any) -> Any:
         self._nav_steps += 1
         if self._nav_steps > self.NAV_CAP:
-            return self._fall_to_bfs()
+            return self._route_after_nav()
         if state is GameState.GAME_OVER:
             return self._reset_for_next()  # this hypothesis died; try the next target
         if self._hypo_last == RESET:  # at the level root
@@ -758,12 +859,12 @@ class MyAgent(Agent):  # type: ignore[misc]
                 tok = self._hypo_path.popleft()
                 self._hypo_last = tok
                 return self._to_action(tok)
-        return self._fall_to_bfs()
+        return self._route_after_nav()
 
     def _reset_for_next(self) -> Any:
         self._hypo_path = None
         if not self._hypo_targets:
-            return self._fall_to_bfs()
+            return self._route_after_nav()
         self._hypo_last = RESET
         return GameAction.RESET
 
@@ -771,6 +872,104 @@ class MyAgent(Agent):  # type: ignore[misc]
         self._phase = "bfs"
         self._search = ReplaySearch(step_modulus=self.STEP_MODULUS)
         return GameAction.RESET
+
+    # -- router: after nav fails, try clickscan / combosearch before the BFS catch-all --
+    def _route_after_nav(self) -> Any:
+        # Movement games (a cursor was detected) go straight to BFS — clickscan/combosearch are
+        # for non-movement click/puzzle games, and would only starve the BFS that solves these.
+        if self._nav.cursor_color is not None:
+            return self._fall_to_bfs()
+        eff = sorted(s for s in self._simples if s in self._eff_simples)
+        simples_dead = bool(self._simples) and not eff
+        if self._has_click and simples_dead:
+            self._phase = "clickscan"
+            self._cs_seq, self._cs_last, self._cs_root_sig = deque(), RESET, None
+            self._cs_seen, self._eff_clicks, self._cs_actions, self._cs_probed = set(), [], 0, 0
+            if _DEBUG:
+                print(f"[route] {self.game_id}: → clickscan", flush=True)
+            return GameAction.RESET
+        if 1 <= len(eff) <= self.COMBO_EXHAUSTIVE_MAX:
+            self._phase = "combosearch"
+            self._combo_simples, self._combo_depth = eff, 1
+            self._combo_iter, self._combo_plan, self._combo_actions = None, deque(), 0
+            if _DEBUG:
+                print(f"[route] {self.game_id}: → combosearch eff={eff}", flush=True)
+            return GameAction.RESET
+        return self._fall_to_bfs()
+
+    # -- phase: dense click scan → find effective click positions, then focus BFS on them --
+    def _clickscan_targets(self, grid: np.ndarray) -> list[tuple[int, int]]:
+        corners = [(2, 2), (61, 2), (2, 61), (61, 61), (31, 2), (2, 31)]
+        salient = priority_click_targets(grid, self.CLICK_BUDGET)
+        dense = [(x, y) for y in range(0, GRID_SIZE, self.DENSE_SCAN_STEP)
+                 for x in range(0, GRID_SIZE, self.DENSE_SCAN_STEP)]
+        out: list[tuple[int, int]] = []
+        seen: set[tuple[int, int]] = set()
+        for p in corners + salient + dense:
+            if p not in seen:
+                seen.add(p)
+                out.append(p)
+        return out
+
+    def _clickscan_phase(self, grid: np.ndarray, state: Any) -> Any:
+        self._cs_actions += 1
+        if self._cs_actions > self.CLICKSCAN_BUDGET:
+            return self._clickscan_done()
+        if self._cs_last == RESET:
+            if self._cs_root_sig is None:  # first entry: at root, build the scan sequence
+                self._cs_root_sig = frame_signature(grid, self._mask)
+                positions = self._clickscan_targets(grid)
+                seq: list[str] = []
+                for i, (x, y) in enumerate(positions):
+                    seq.append(f"ACTION6:{x},{y}")
+                    if i < len(positions) - 1:
+                        seq.append(RESET)
+                self._cs_seq = deque(seq)
+        elif self._cs_last is not None and self._cs_last.startswith("ACTION6:"):
+            if state is not GameState.GAME_OVER:
+                sig = frame_signature(grid, self._mask)
+                if sig != self._cs_root_sig and sig not in self._cs_seen:
+                    self._cs_seen.add(sig)
+                    x, y = (int(v) for v in self._cs_last.split(":", 1)[1].split(","))
+                    self._eff_clicks.append((x, y))
+            self._cs_probed += 1
+            if self._cs_probed >= 6 and not self._eff_clicks:  # corner-skip: clicks do nothing
+                self._eff_clicks = None
+                return self._fall_to_bfs()
+        if not self._cs_seq:
+            return self._clickscan_done()
+        self._cs_last = self._cs_seq.popleft()
+        return self._to_action(self._cs_last)
+
+    def _clickscan_done(self) -> Any:
+        if not self._eff_clicks:  # nothing found → let BFS use the default salient targets
+            self._eff_clicks = None
+        if _DEBUG:
+            n = len(self._eff_clicks) if self._eff_clicks else 0
+            print(f"[clickscan] {self.game_id}: {n} effective clicks → BFS", flush=True)
+        return self._fall_to_bfs()
+
+    # -- phase: iterative-deepening over effective simple-action sequences --
+    def _combosearch_phase(self, grid: np.ndarray, state: Any) -> Any:
+        if self._combo_actions > self.COMBOSEARCH_CAP:
+            return self._fall_to_bfs()
+        if state is GameState.GAME_OVER:
+            self._combo_plan = deque()  # current combo died → next combo (starts with RESET)
+        if self._combo_plan:
+            self._combo_actions += 1
+            return self._to_action(self._combo_plan.popleft())
+        if self._combo_iter is None:
+            self._combo_iter = product(self._combo_simples, repeat=self._combo_depth)
+        nxt = next(self._combo_iter, None)
+        while nxt is None:
+            self._combo_depth += 1
+            if self._combo_depth > self.COMBO_MAX_DEPTH:
+                return self._fall_to_bfs()
+            self._combo_iter = product(self._combo_simples, repeat=self._combo_depth)
+            nxt = next(self._combo_iter, None)
+        self._combo_plan = deque([RESET, *nxt])
+        self._combo_actions += 1
+        return self._to_action(self._combo_plan.popleft())
 
     def _candidates(self, latest_frame: Any, grid: np.ndarray) -> list[str]:
         available = getattr(latest_frame, "available_actions", None)
@@ -787,11 +986,12 @@ class MyAgent(Agent):  # type: ignore[misc]
             else:
                 simple.append(a.name)
         simple.sort()
-        clicks = (
-            [f"ACTION6:{x},{y}" for (x, y) in priority_click_targets(grid, self.CLICK_BUDGET)]
-            if has_click
-            else []
-        )
+        if not has_click:
+            clicks: list[str] = []
+        elif self._eff_clicks is not None:  # clickscan discovered the effective positions → focus BFS
+            clicks = [f"ACTION6:{x},{y}" for (x, y) in self._eff_clicks]
+        else:
+            clicks = [f"ACTION6:{x},{y}" for (x, y) in priority_click_targets(grid, self.CLICK_BUDGET)]
         return simple + clicks
 
     def _to_action(self, token: str) -> Any:
