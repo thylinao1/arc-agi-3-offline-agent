@@ -61,13 +61,25 @@ Newest at the bottom.
 - [x] **Determinism: CONFIRMED ✓** (2026-06-18) — `experiments/determinism.py --game ls20 --steps 40`: identical
       frame signatures across two replays. Open-loop replay is safe → exact hash-keyed transition table is valid.
 
-## NEXT (the actual competition work — port occam's solving machinery)
-- [ ] **Per-game counter detection** (not a generic volatility heuristic): port occam's `counter_mask` derivation
-      so state-dedup works on animated games. This is the #1 blocker to any solves.
-- [ ] **Priority-tier action ranking** (occam `priority_tiers.py` + `action_ranker.py`): rank which actions/clicks
-      are worth probing first instead of always-ACTION1-first.
-- [ ] **Give-up budget** (occam `rhae.compute_giveup_budget`) wired into the DFS to bound per-level exploration.
-- [ ] Re-run the reset-counting experiment once a level is solvable, to settle the architecture fork empirically.
+- 2026-06-19 — **Rewrote the solver: BFS reset-replay + occam's perception ported.** Geometric status-bar/counter
+      masking (`identify_status_bars`: edge-hugging thin/twinned segments) + 5-tier salience click ranking
+      (`priority_click_targets`) + effective-action-first ordering. BFS (breadth before depth) finds shallow wins
+      the old DFS dove past. Fixed an `@dataclass`/importlib crash (plain `Segment` class). 13/13 tests pass.
+- 2026-06-19 — **OFF ZERO ✓ — first solves.** Coverage scales with budget: 250 steps → **1/25** (vc33);
+      800 steps → **3/25** (vc33, lp85, sp80), aggregate RHAE 0.0145. The pipeline genuinely solves now.
+
+## NEXT (close the gap to occam's 17/25 — make reset-replay action-efficient)
+- [x] ~~Per-game counter detection~~ — done (geometric status-bar masking).
+- [x] ~~Priority-tier action ranking~~ — done (`priority_click_targets` + effective-first).
+- [ ] **Action efficiency is now the limiter** (reset-replay re-replays prefixes → burns the budget before reaching
+      deep solutions). Port occam's `step_modulus` state hashing + `max_unique_states` cap + effective-action
+      PRUNING so the per-level budget reaches deeper wins. Highest-leverage next step.
+- [ ] **Per-level give-up budget** (`eval/rhae.giveup_budget`, ≈5× human) wired in so a stuck level stops wasting
+      actions the others need.
+- [ ] Tune the real per-game budget toward the 5× cutoff (human baselines are hundreds; 800 local steps already
+      lifts coverage 1→3).
+- [ ] Re-run the reset-counting experiment now that levels are solvable (vc33/lp85/sp80), to settle the
+      architecture fork empirically.
 - [ ] **First-exposure cost vs 5× cutoff:** measure naive solve cost vs the give-up budget on 2–3 public games.
 - [ ] **Offline audit:** grep `agent/my_agent.py` for `requests|urllib|httpx|huggingface_hub|torch.hub|socket`;
       run the notebook with internet disabled locally before submitting.

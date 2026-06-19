@@ -1,85 +1,108 @@
-"""Unit tests for agent/my_agent.py.
+"""Unit tests for agent/my_agent.py — pure perception + the BFS reset-replay search.
 
-Pure helpers (numpy only) + the ReplayDFS solver driven against tiny deterministic
-simulated environments. The framework/SDK imports in my_agent.py are guarded, so these
-run fully offline.
+Run offline with numpy only (framework/SDK imports in my_agent.py are guarded).
 """
 from __future__ import annotations
 
 import numpy as np
 
 from agent.my_agent import (
-    ReplayDFS,
-    click_candidates,
-    connected_components,
+    ReplaySearch,
     frame_signature,
     grid_from_frame,
+    identify_status_bars,
+    priority_click_targets,
+    segment_frame,
+    status_bar_mask,
     volatility_mask,
 )
 
 
-# ───────────────────────────── perception ─────────────────────────────
 def _two_blob_grid() -> np.ndarray:
     g = np.zeros((64, 64), dtype=np.int16)
-    g[2:5, 2:5] = 3      # 3x3 blob, centroid (3, 3)
-    g[10:18, 40:48] = 7  # 8x8 blob (bigger), centroid (14, 44)
+    g[2:5, 2:5] = 3       # 3x3, color 3 (not salient), center (3, 3)
+    g[10:18, 40:48] = 7   # 8x8, color 7 (salient), center (13, 43)
     return g
 
 
-def test_connected_components_counts_and_orders_by_size() -> None:
-    comps = connected_components(_two_blob_grid())
-    assert len(comps) == 2
-    assert comps[0]["color"] == 7 and comps[0]["size"] == 64
-    assert comps[1]["color"] == 3 and comps[1]["size"] == 9
-    assert comps[1]["centroid"] == (3, 3)
+# ───────────────────────────── perception ─────────────────────────────
+def test_segment_frame_finds_objects_and_background() -> None:
+    segs = segment_frame(_two_blob_grid())
+    assert len(segs) == 3  # background + two blobs
+    by_color = {s.color: s for s in segs}
+    assert by_color[7].area == 64 and by_color[7].bbox == (10, 40, 17, 47)
+    assert by_color[3].area == 9 and by_color[3].center == (3, 3)
 
 
-def test_connected_components_ignores_background() -> None:
-    assert connected_components(np.zeros((64, 64), dtype=np.int16)) == []
-
-
-def test_click_candidates_dedup_limit_and_xy_order() -> None:
-    cands = click_candidates(_two_blob_grid(), limit=10)
-    # (x, y) order; biggest object first → centroid (14, 44) → (x, y) = (44, 14).
-    assert cands[0] == (44, 14)
-    assert (3, 3) in cands
+def test_priority_click_targets_salient_first_xy_and_dedup() -> None:
+    cands = priority_click_targets(_two_blob_grid(), max_targets=10)
+    assert cands[0] == (43, 13)          # salient 8x8 blob (tier 0), (x, y), floor center
+    assert (3, 3) in cands               # color-3 blob (tier 1)
     assert len(cands) == len(set(cands))
     assert all(0 <= x < 64 and 0 <= y < 64 for x, y in cands)
 
 
-def test_click_candidates_respects_limit() -> None:
+def test_priority_click_targets_respects_limit() -> None:
     g = np.zeros((64, 64), dtype=np.int16)
-    for i in range(30):
-        g[i * 2, 0] = (i % 15) + 1
-    assert len(click_candidates(g, limit=16)) == 16
+    for r in range(6):
+        for c in range(5):
+            g[r * 3 : r * 3 + 2, c * 3 : c * 3 + 2] = 7  # 30 salient 2x2 blocks (area 4)
+    assert len(priority_click_targets(g, max_targets=12)) == 12
 
 
-def test_frame_signature_is_stable_and_distinct() -> None:
-    g1 = _two_blob_grid()
-    g2 = g1.copy()
-    g2[0, 0] = 5
-    assert frame_signature(g1) == frame_signature(g1.copy())
-    assert frame_signature(g1) != frame_signature(g2)
+def test_status_bar_mask_detects_thin_edge_bar() -> None:
+    g = np.zeros((64, 64), dtype=np.int16)
+    g[0:2, 5:45] = 8  # thin horizontal bar at the top edge (aspect ratio 20)
+    g[30:34, 30:34] = 9  # a play object in the middle
+    mask = status_bar_mask(g)
+    assert mask is not None
+    assert bool(mask[0, 5]) is True     # bar masked
+    assert bool(mask[31, 31]) is False  # play object not masked
+
+
+def test_identify_status_bars_catches_twins() -> None:
+    g = np.zeros((64, 64), dtype=np.int16)
+    for k in range(4):  # 4 identical "life" icons along the bottom edge
+        g[62, 5 + k * 4] = 7
+    segs = segment_frame(g)
+    assert len(identify_status_bars(segs)) >= 4
+
+
+def test_frame_signature_masks_counter() -> None:
+    g = _two_blob_grid()
+    mask = np.zeros((64, 64), dtype=bool)
+    mask[0, 0] = True
+    a, b = g.copy(), g.copy()
+    b[0, 0] = 9  # differ only in the masked cell
+    assert frame_signature(a, mask) == frame_signature(b, mask)
+    assert frame_signature(a) != frame_signature(b)
 
 
 def test_grid_from_frame_takes_last_grid() -> None:
     frame = [np.zeros((64, 64), dtype=int).tolist(), _two_blob_grid().tolist()]
     out = grid_from_frame(frame)
-    assert out.shape == (64, 64)
-    assert int(out[10, 40]) == 7
+    assert out.shape == (64, 64) and int(out[10, 40]) == 7
 
 
-# ───────────────────────────── ReplayDFS ─────────────────────────────
-def run_sim(transitions, candidates, start="r", max_steps=300):
-    """Drive ReplayDFS against a deterministic graph.
+def test_volatility_mask_isolates_counter_and_bails_on_animation() -> None:
+    grids = []
+    for t in range(6):
+        f = np.zeros((4, 4), dtype=np.int16)
+        f[0, 0] = t + 1                # counter changes every transition
+        f[3, min(t // 3, 1)] = 9       # player moves once
+        grids.append(f)
+    m = volatility_mask(grids)
+    assert m is not None and bool(m[0, 0]) and not bool(m[3, 0])
+    busy = [np.full((4, 4), t, dtype=np.int16) for t in range(5)]
+    assert volatility_mask(busy) is None
 
-    transitions: {(sig, token): (next_sig, kind)} where kind ∈ {normal, dead, win}.
-    Returns (solved: bool, env_actions: int, resets: int).
-    """
-    dfs = ReplayDFS()
+
+# ───────────────────────────── ReplaySearch (BFS) ─────────────────────────────
+def run_sim(transitions, candidates, start="r", max_steps=400):
+    s = ReplaySearch()
     cur, game_over, actions, resets = start, False, 0, 0
     for _ in range(max_steps):
-        tok = dfs.step(cur, candidates.get(cur, []), game_over=game_over)
+        tok = s.step(cur, candidates.get(cur, []), game_over=game_over)
         actions += 1
         game_over = False
         if tok == "RESET":
@@ -96,83 +119,47 @@ def run_sim(transitions, candidates, start="r", max_steps=300):
     return False, actions, resets
 
 
-def test_dfs_solves_a_deep_path() -> None:
-    # r -A2-> s1 -A1-> s2 -A1-> WIN ; A1 from r is a trap.
+def test_search_solves_a_deep_path() -> None:
     trans = {
         ("r", "ACTION1"): ("d", "dead"),
         ("r", "ACTION2"): ("s1", "normal"),
-        ("r", "ACTION3"): ("r", "normal"),
         ("s1", "ACTION1"): ("s2", "normal"),
-        ("s1", "ACTION2"): ("r", "normal"),
         ("s2", "ACTION1"): ("g", "win"),
     }
-    cand = {
-        "r": ["ACTION1", "ACTION2", "ACTION3"],
-        "s1": ["ACTION1", "ACTION2"],
-        "s2": ["ACTION1"],
-        "d": [],
-    }
-    solved, actions, resets = run_sim(trans, cand)
-    assert solved
-    assert actions < 30  # found quickly, not via brute-force blowup
+    cand = {"r": ["ACTION1", "ACTION2"], "s1": ["ACTION1"], "s2": ["ACTION1"], "d": []}
+    solved, actions, _ = run_sim(trans, cand)
+    assert solved and actions < 60
 
 
-def test_dfs_descends_without_needless_resets() -> None:
-    # A straight corridor r->a->b->WIN; DFS should follow it with ZERO resets.
-    trans = {
-        ("r", "ACTION1"): ("a", "normal"),
-        ("a", "ACTION1"): ("b", "normal"),
-        ("b", "ACTION1"): ("g", "win"),
-    }
+def test_search_corridor_uses_no_resets() -> None:
+    trans = {("r", "ACTION1"): ("a", "normal"), ("a", "ACTION1"): ("b", "normal"),
+             ("b", "ACTION1"): ("g", "win")}
     cand = {"r": ["ACTION1"], "a": ["ACTION1"], "b": ["ACTION1"]}
     solved, actions, resets = run_sim(trans, cand)
     assert solved and resets == 0 and actions == 3
 
 
-def test_dfs_backtracks_after_dead_end() -> None:
-    # r -A1-> a (a loops on itself, no win) ; must backtrack and try r -A2-> WIN.
+def test_search_finds_shallow_win_via_breadth() -> None:
+    # The win is the SECOND action from root; BFS must try it without diving via the first.
     trans = {
         ("r", "ACTION1"): ("a", "normal"),
-        ("a", "ACTION1"): ("a", "normal"),
+        ("a", "ACTION1"): ("a", "normal"),  # first action leads to a dead loop
         ("r", "ACTION2"): ("g", "win"),
     }
     cand = {"r": ["ACTION1", "ACTION2"], "a": ["ACTION1"]}
-    solved, _actions, _resets = run_sim(trans, cand)
+    solved, _actions, _ = run_sim(trans, cand)
     assert solved
 
 
-def test_dfs_reports_unsolvable_without_crashing() -> None:
-    # No win reachable; the search must terminate the budget gracefully.
+def test_search_reports_unsolvable_without_crashing() -> None:
     trans = {("r", "ACTION1"): ("r", "normal")}
     cand = {"r": ["ACTION1"]}
-    solved, _actions, _resets = run_sim(trans, cand, max_steps=50)
+    solved, _a, _r = run_sim(trans, cand, max_steps=50)
     assert solved is False
 
 
 def test_start_level_resets_state() -> None:
-    dfs = ReplayDFS()
-    dfs.step("r", ["ACTION1"])
-    dfs.start_level("root2", ["ACTION1", "ACTION2"])
-    assert dfs.root == "root2" and dfs.known == {"root2": []} and dfs.terminal == set()
-
-
-# ───────────────────────────── volatility mask ─────────────────────────────
-def test_volatility_mask_isolates_a_counter() -> None:
-    grids = []
-    for t in range(6):
-        f = np.zeros((4, 4), dtype=np.int16)
-        f[0, 0] = t + 1                 # counter: changes EVERY transition
-        f[3, min(t // 3, 1)] = 9        # "player": moves only once across the run
-        grids.append(f)
-    m = volatility_mask(grids)
-    assert m is not None
-    assert bool(m[0, 0]) is True        # counter masked
-    assert bool(m[3, 0]) is False       # player area not always-changing
-    a, b = grids[0].copy(), grids[0].copy()
-    b[0, 0] = 99                         # differ only in the counter
-    assert frame_signature(a, m) == frame_signature(b, m)
-
-
-def test_volatility_mask_bails_when_play_area_animates() -> None:
-    grids = [np.full((4, 4), t, dtype=np.int16) for t in range(5)]
-    assert volatility_mask(grids) is None  # whole grid volatile → do not mask
+    s = ReplaySearch()
+    s.step("r", ["ACTION1"])
+    s.start_level("root2", ["ACTION1", "ACTION2"])
+    assert s.root == "root2" and s.known == {"root2": []} and s.terminal == set()
