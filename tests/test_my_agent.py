@@ -208,16 +208,30 @@ def test_reactive_nav_probe_detects_cursor_and_direction() -> None:
     assert nav.arrow_map.get("right") == "ACTION4"
 
 
-def test_reactive_nav_moves_toward_target_then_interacts() -> None:
+def test_reactive_nav_candidate_targets_rarest_first() -> None:
+    nav = ReactiveNav()
+    nav.bg, nav.cursor_color = 0, 7
+    g = np.zeros((8, 8), dtype=np.int16)
+    g[0, 0] = 7              # cursor (excluded)
+    g[1, 1] = 9; g[2, 2] = 9  # color 9 appears twice
+    g[3, 3] = 5              # color 5 appears once (rarer)
+    cands = nav.candidate_targets(g)
+    assert cands[0] == 5 and 9 in cands
+    assert 7 not in cands and 0 not in cands
+
+
+def test_reactive_nav_plan_path_to_target_with_interact() -> None:
     nav = ReactiveNav()
     nav.cursor_color, nav.bg, nav.interact = 7, 0, "ACTION5"
-    nav.arrow_map = {"right": "ACTION4", "left": "ACTION3"}
-    nav.threshold = 1.0
-    grid = np.zeros((8, 8), dtype=np.int16); grid[2, 2] = 7; grid[2, 5] = 9  # target to the right
-    assert nav.next_move(grid) == "ACTION4"
-    nav.threshold = 3.0
-    near = np.zeros((8, 8), dtype=np.int16); near[2, 4] = 7; near[2, 5] = 9  # adjacent → interact
-    assert nav.next_move(near) == "ACTION5"
+    nav.arrow_map = {"up": "ACTION1", "down": "ACTION2", "left": "ACTION3", "right": "ACTION4"}
+    nav.step_sizes = [2.0]  # → tile size 2, an 8x8 grid becomes a 4x4 logical grid
+    g = np.zeros((8, 8), dtype=np.int16)
+    g[0:2, 0:2] = 7          # cursor at logical (0, 0)
+    g[0:2, 6:8] = 9          # target at logical (0, 3)
+    path = nav.plan_path(g, target_color=9)
+    assert path is not None
+    assert path[-1] == "ACTION5"          # interacts on arrival
+    assert "ACTION4" in path              # moves right toward the target
 
 
 def test_reactive_nav_not_ready_without_two_arrows() -> None:

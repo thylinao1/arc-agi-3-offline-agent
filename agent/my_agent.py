@@ -394,7 +394,6 @@ class ReactiveNav:
         self.arrow_map: dict[str, str] = {}  # direction -> action name
         self.interact: Optional[str] = None
         self.step_sizes: list[float] = []
-        self.threshold: float = 1.0
 
     def probe(self, root: np.ndarray, result: np.ndarray, action: str) -> None:
         diff = root != result
@@ -427,40 +426,26 @@ class ReactiveNav:
     def finalize(self, simples: list[str]) -> None:
         used = set(self.arrow_map.values())
         self.interact = next((a for a in simples if a not in used), None)
-        step = float(np.median(self.step_sizes)) if self.step_sizes else 1.0
-        self.threshold = max(1.1, step / 2 + 0.1) if (step > 2 and self.interact) else 1.0
 
     def ready(self) -> bool:
         return self.cursor_color is not None and len(self.arrow_map) >= 2
 
-    def next_move(self, grid: np.ndarray) -> Optional[str]:
-        if self.cursor_color is None:
-            return None
-        pos = np.argwhere(grid == self.cursor_color)
-        if len(pos) == 0:
-            return None
-        cursor = pos.mean(0)
+    def candidate_targets(self, grid: np.ndarray, limit: int = 6) -> list[int]:
+        """Distinct non-background, non-cursor colors, rarest first — goal hypotheses."""
         vals, counts = np.unique(grid, return_counts=True)
-        count_of = {int(v): int(c) for v, c in zip(vals, counts)}
-        non_bg = [int(v) for v in vals if int(v) not in (self.bg, 0, self.cursor_color)]
-        if not non_bg:
-            return None
-        target_color = min(non_bg, key=lambda c: count_of[c])
-        targets = np.argwhere(grid == target_color)
-        target = targets[np.abs(targets - cursor).sum(1).argmin()]
-        dr, dc = float(target[0] - cursor[0]), float(target[1] - cursor[1])
-        if abs(dr) < self.threshold and abs(dc) < self.threshold and self.interact:
-            return self.interact
-        name = ("up" if dr < 0 else "down") if abs(dr) >= abs(dc) else ("left" if dc < 0 else "right")
-        return self.arrow_map.get(name)
+        cands = [(int(v), int(n)) for v, n in zip(vals, counts)
+                 if int(v) not in (self.bg, 0, self.cursor_color)]
+        cands.sort(key=lambda x: x[1])
+        return [c for c, _ in cands[:limit]]
 
     _DIRS = {"up": (-1, 0), "down": (1, 0), "left": (0, -1), "right": (0, 1)}
 
-    def plan_path(self, grid: np.ndarray) -> Optional[list[str]]:
-        """Logical-grid BFS pathfinding: cursor → nearest rare target, around walls.
+    def plan_path(self, grid: np.ndarray, target_color: Optional[int] = None) -> Optional[list[str]]:
+        """Logical-grid BFS pathfinding: cursor → a target color, around walls.
 
         Tiles the grid by the cursor's step size, treats colors covering >20% as walls, and
-        BFS-searches a directional action path. Returns the action-name list, or None.
+        BFS-searches a directional action path (+ interact). `target_color` selects the goal
+        hypothesis; if None, the rarest color is used. Returns the action-name list, or None.
         """
         if self.cursor_color is None or len(self.arrow_map) < 2 or self.bg is None:
             return None
@@ -484,7 +469,10 @@ class ReactiveNav:
         if not colors:
             return None
         counts = {c: int((logical == c).sum()) for c in colors}
-        target_color = min(counts, key=lambda c: counts[c])
+        if target_color is None:
+            target_color = min(counts, key=lambda c: counts[c])
+        elif target_color not in counts:
+            return None  # requested target washed out at logical resolution
         tpos = np.argwhere(logical == target_color)
         if len(tpos) == 0:
             return None
@@ -519,16 +507,16 @@ class MyAgent(Agent):  # type: ignore[misc]
     CLICK_BUDGET = 24          # salient click targets per state (coverage > branching savings)
     GIVEUP_PER_LEVEL = 1000    # stop burning actions on a stuck level (≈ the grader's 5x cutoff)
     STEP_MODULUS = 1           # >1 only for known-periodic games (per-game lever, off by default)
-    REACTIVE_CAP = 300         # max reactive-nav steps before falling back to BFS
-    STUCK_CAP = 6              # reactive steps with no frame change before bailing
+    NAV_CAP = 300              # max goal-hypothesis-search steps before falling back to BFS
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._level = 0
+        self._nav_target_hint: Optional[int] = None  # target color that solved a prior level
         self._reset_level()
 
     def _reset_level(self) -> None:
-        # Phases: warmup → navprobe → reactive → bfs.
+        # Phases: warmup → navprobe → navhypo (goal-hypothesis search) → bfs.
         self._phase = "warmup"
         self._mask: Optional[np.ndarray] = None
         self._warm: list[np.ndarray] = []
@@ -539,11 +527,11 @@ class MyAgent(Agent):  # type: ignore[misc]
         self._nav_last = RESET
         self._nav_root: Optional[np.ndarray] = None
         self._simples: list[str] = []
-        self._reactive_steps = 0
-        self._last_sig: Optional[str] = None
-        self._stuck = 0
-        self._path: Optional[deque[str]] = None
-        self._planned = False
+        self._nav_steps = 0
+        self._hypo_targets: Optional[deque[int]] = None
+        self._hypo_path: Optional[deque[str]] = None
+        self._hypo_last = RESET
+        self._hypo_target: Optional[int] = None
 
     @property
     def name(self) -> str:
@@ -560,6 +548,8 @@ class MyAgent(Agent):  # type: ignore[misc]
 
         if latest_frame.levels_completed > self._level:
             self._level = latest_frame.levels_completed
+            if self._hypo_target is not None:  # the target being driven just solved a level
+                self._nav_target_hint = self._hypo_target
             self._reset_level()
 
         self._level_actions += 1
@@ -572,8 +562,8 @@ class MyAgent(Agent):  # type: ignore[misc]
             return self._warmup_phase(latest_frame, grid, state)
         if self._phase == "navprobe":
             return self._navprobe_phase(grid, state)
-        if self._phase == "reactive":
-            return self._reactive_phase(grid, state)
+        if self._phase == "navhypo":
+            return self._navhypo_phase(grid, state)
 
         sig = frame_signature(grid, self._mask)
         candidates = self._candidates(latest_frame, grid)
@@ -613,10 +603,10 @@ class MyAgent(Agent):  # type: ignore[misc]
         self._nav_last = RESET
         if self._nav.ready():
             if _DEBUG:
-                print(f"[nav] {self.game_id}: REACTIVE cursor={self._nav.cursor_color} "
+                print(f"[nav] {self.game_id}: NAVHYPO cursor={self._nav.cursor_color} "
                       f"arrows={self._nav.arrow_map} interact={self._nav.interact}", flush=True)
-            self._phase = "reactive"
-            self._reactive_steps, self._last_sig, self._stuck = 0, None, 0
+            self._phase = "navhypo"
+            self._hypo_last, self._hypo_targets, self._hypo_path, self._nav_steps = RESET, None, None, 0
         else:
             if _DEBUG:
                 print(f"[nav] {self.game_id}: no cursor → BFS (arrows={self._nav.arrow_map})", flush=True)
@@ -624,33 +614,45 @@ class MyAgent(Agent):  # type: ignore[misc]
             self._search = ReplaySearch(step_modulus=self.STEP_MODULUS)
         return GameAction.RESET  # clean root start for the next phase
 
-    # -- phase: pathfind to the target (around walls), then greedy; bail to BFS on death/stall --
-    def _reactive_phase(self, grid: np.ndarray, state: Any) -> Any:
+    # -- phase: goal-hypothesis search — pathfind to each candidate target, interact, test --
+    def _navhypo_phase(self, grid: np.ndarray, state: Any) -> Any:
+        self._nav_steps += 1
+        if self._nav_steps > self.NAV_CAP:
+            return self._fall_to_bfs()
         if state is GameState.GAME_OVER:
-            return self._fall_to_bfs()
-        self._reactive_steps += 1
-        if self._reactive_steps > self.REACTIVE_CAP:
-            return self._fall_to_bfs()
+            return self._reset_for_next()  # this hypothesis died; try the next target
+        if self._hypo_last == RESET:  # at the level root
+            if self._hypo_targets is None:
+                cands = self._nav.candidate_targets(grid)
+                hint = [self._nav_target_hint] if self._nav_target_hint is not None else []
+                self._hypo_targets = deque(hint + [c for c in cands if c != self._nav_target_hint])
+            return self._start_next_target(grid)
+        if self._hypo_path:  # mid-path
+            tok = self._hypo_path.popleft()
+            self._hypo_last = tok
+            return self._to_action(tok)
+        return self._reset_for_next()  # path finished without solving → next hypothesis
 
-        # Try a logical-grid pathfinding plan once, from the current (root) frame.
-        if not self._planned:
-            self._planned = True
-            p = self._nav.plan_path(grid)
-            if p:
+    def _start_next_target(self, root_grid: np.ndarray) -> Any:
+        while self._hypo_targets:
+            tc = self._hypo_targets.popleft()
+            path = self._nav.plan_path(root_grid, tc)
+            if path:
                 if _DEBUG:
-                    print(f"[nav] {self.game_id}: PATH len={len(p)}", flush=True)
-                self._path = deque(p)
-        if self._path:
-            return self._to_action(self._path.popleft())
+                    print(f"[nav] {self.game_id}: HYPO target={tc} path={len(path)}", flush=True)
+                self._hypo_target = tc
+                self._hypo_path = deque(path)
+                tok = self._hypo_path.popleft()
+                self._hypo_last = tok
+                return self._to_action(tok)
+        return self._fall_to_bfs()
 
-        # Greedy fallback: move toward the nearest target; bail if the cursor stalls.
-        move = self._nav.next_move(grid)
-        sig = frame_signature(grid, self._mask)
-        self._stuck = self._stuck + 1 if sig == self._last_sig else 0
-        self._last_sig = sig
-        if move is None or self._stuck >= self.STUCK_CAP:
+    def _reset_for_next(self) -> Any:
+        self._hypo_path = None
+        if not self._hypo_targets:
             return self._fall_to_bfs()
-        return self._to_action(move)
+        self._hypo_last = RESET
+        return GameAction.RESET
 
     def _fall_to_bfs(self) -> Any:
         self._phase = "bfs"

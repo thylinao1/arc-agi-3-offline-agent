@@ -91,9 +91,17 @@ Newest at the bottom.
       19/19 tests.** The solvers stay — they'll crack matching simple-movement games on the hidden ~110-game set
       (occam keeps them for the same reason). A `ARC_DEBUG=1` env var prints nav activation for diagnostics.
 
-## NEXT (to occam's 17/25 — goal inference + the rest of occam's pipeline)
-- [ ] **Goal inference** is the real blocker: "rarest-color tile" is the wrong target for most games. Infer the
-      goal from what changes when levels complete, or from reward-shaped exploration, not a color heuristic.
+- 2026-06-19 — **Goal-hypothesis search** replaced the single rarest-target greedy nav: enumerate candidate target
+      colors (rarest-first + a cross-level cached hint), and for EACH, pathfind + interact + test, falling to BFS if
+      none win. **RESULT: aggregate RHAE 0.0144 → 0.0843 (≈6×).** sp80 (a movement game) now solves via a short
+      pathfinding route (4–15 actions) instead of hundreds of BFS reset-replay actions, so its efficiency score
+      shot up. **Coverage unchanged at 3/25** — the win was EFFICIENCY (the scored Y-axis), not coverage. Dropped
+      the greedy `next_move` (it solved nothing); 20/20 tests. `ARC_DEBUG=1` prints `HYPO target=… path=…`.
+
+## NEXT (coverage needs richer goal inference; efficiency on solved games is now good)
+- [ ] **Non-reach-target goals**: the unsolved movement games (ls20, m0r0, wa30, re86…) and puzzle games need goals
+      beyond "reach a tile" — collect-all-of-color, arrange/match, push-block. Infer the goal from what changes at a
+      level-complete event (when BFS/hypo accidentally wins) and generalize it.
 - [ ] Port occam's remaining solvers: **combo search** (exhaustive short action sequences), **deepcopy BFS**
       (perfect state cloning, no replay cost), **dense click scan** (find ALL effective click positions),
       `_solve_reactive_click`, and **cross-level winning-combo caching** (reuse level-1 solutions on later levels).
