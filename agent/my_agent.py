@@ -575,6 +575,8 @@ class MyAgent(Agent):  # type: ignore[misc]
         super().__init__(*args, **kwargs)
         self._level = 0
         self._nav_target_hint: Optional[int] = None  # target color that solved a prior level
+        self._winning_combo: Optional[list] = None   # the prior level's solving action sequence
+        self._since_reset: list = []                 # actions emitted since the last RESET
         self._reset_level()
 
     def _reset_level(self) -> None:
@@ -594,6 +596,10 @@ class MyAgent(Agent):  # type: ignore[misc]
         self._hypo_path: Optional[deque[str]] = None
         self._hypo_last = RESET
         self._hypo_target: Optional[int] = None
+        # Cross-level reuse: replay the prior level's winning combo first (occam short-circuit).
+        self._combo_q: deque = deque(self._winning_combo) if self._winning_combo else deque()
+        if self._winning_combo:
+            self._phase = "combo"
 
     @property
     def name(self) -> str:
@@ -603,6 +609,26 @@ class MyAgent(Agent):  # type: ignore[misc]
         return latest_frame.state is GameState.WIN
 
     def choose_action(self, frames: list[Any], latest_frame: Any) -> Any:
+        action = self._decide(frames, latest_frame)
+        self._record(action)
+        return action
+
+    def _record(self, action: Any) -> None:
+        """Track the action sequence since the last RESET, for winning-combo caching."""
+        if action is GameAction.RESET:
+            self._since_reset = []
+            return
+        name = getattr(action, "name", None)
+        if name == "ACTION6":
+            try:
+                d = action.action_data.model_dump()
+                self._since_reset.append(("ACTION6", int(d.get("x", 0)), int(d.get("y", 0))))
+            except Exception:
+                self._since_reset.append(("ACTION6", 0, 0))
+        elif name:
+            self._since_reset.append((name,))
+
+    def _decide(self, frames: list[Any], latest_frame: Any) -> Any:
         state = latest_frame.state
         if state is GameState.NOT_PLAYED:
             self._search.note_reset()
@@ -610,8 +636,11 @@ class MyAgent(Agent):  # type: ignore[misc]
 
         if latest_frame.levels_completed > self._level:
             self._level = latest_frame.levels_completed
-            if self._hypo_target is not None:  # the target being driven just solved a level
+            if self._since_reset:  # the actions since the last RESET just solved a level
+                self._winning_combo = list(self._since_reset)
+            if self._hypo_target is not None:
                 self._nav_target_hint = self._hypo_target
+            self._since_reset = []
             self._reset_level()
 
         self._level_actions += 1
@@ -620,6 +649,8 @@ class MyAgent(Agent):  # type: ignore[misc]
 
         grid = grid_from_frame(latest_frame.frame)
 
+        if self._phase == "combo":
+            return self._combo_phase(grid, state)
         if self._phase == "warmup":
             return self._warmup_phase(latest_frame, grid, state)
         if self._phase == "navprobe":
@@ -631,6 +662,19 @@ class MyAgent(Agent):  # type: ignore[misc]
         candidates = self._candidates(latest_frame, grid)
         token = self._search.step(sig, candidates, game_over=state is GameState.GAME_OVER)
         return self._to_action(token)
+
+    # -- phase: replay the previous level's winning combo (occam short-circuit) --
+    def _combo_phase(self, grid: np.ndarray, state: Any) -> Any:
+        if state is GameState.GAME_OVER or not self._combo_q:
+            self._phase = "warmup"   # the combo didn't carry the new level → normal solving
+            self._warm = []
+            return GameAction.RESET
+        item = self._combo_q.popleft()
+        if _DEBUG and self._winning_combo and len(self._combo_q) == len(self._winning_combo) - 1:
+            print(f"[combo] {self.game_id}: replaying {len(self._winning_combo)}-action combo", flush=True)
+        if item[0] == "ACTION6":
+            return self._to_action(f"ACTION6:{item[1]},{item[2]}")
+        return self._to_action(item[0])
 
     # -- phase: warmup → freeze mask, then set up the nav probe --
     def _warmup_phase(self, latest_frame: Any, grid: np.ndarray, state: Any) -> Any:

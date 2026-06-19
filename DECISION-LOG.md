@@ -116,7 +116,22 @@ Newest at the bottom.
       the 0.0144 baseline). 21/21 tests. Lesson: nav efficiency is brittle to target-tile + hypothesis-ordering
       choices — locked the best-measured config.
 
-## STATUS: bounded heuristics plateaued at 3/25 coverage / 0.1021 RHAE (best).
+- 2026-06-19 — **Budget diagnostic + winning-combo caching (goal-inference research).** (1) Ran 6 unsolved games
+      at 1000 actions (>> the real ~5× cutoff of hundreds): **0/6 solve** → new-game coverage is NOT a budget/depth
+      problem, it's the goal-signal wall. (2) Implemented occam's winning-combo short-circuit: a thin choose_action
+      wrapper records the action sequence since the last RESET; on level-up it's cached and replayed first on the
+      next level (new `combo` phase). It ACTIVATES (replays 5–15-action combos on ar25/lp85/sp80/vc33) but **pushes
+      NO game past level 1** — level-1 solutions don't carry to the harder level 2. No regression (0.1021 holds);
+      21/21 tests. Kept for hidden-set games with repeated level structure.
+
+## STATUS: bounded heuristics plateaued — 3/25 coverage, 0.1021 RHAE (best), 7× the baseline.
+**Evidence-backed ceiling:** five consecutive levers (efficiency levers, reactive nav, pathfinding, collect-all,
+combo caching) each added **0 public coverage/depth**; the budget diagnostic shows it's not a budget problem. The
+public games' goals are genuinely beyond reach/collect/sequence-reuse, and the only in-game signal is the grid +
+sparse `levels_completed` (no per-frame reward). Moving the number further requires either occam's FULL solver
+ensemble (combo search, deepcopy BFS, dense click scan, reactive-click — a large multi-day port) or novel goal-
+inference research. The agent is a complete, eligible, deterministic, MIT-licensed baseline; recommend consolidating
+and prepping the Kaggle submission rather than more single-lever additions.
 The remaining coverage gap is genuine research, not tweaks. Empirically narrowed: the unsolved movement games need
 **non-reach-target goals** (collect-all-of-color, ordered sequence, push-block, multi-tile arrangement). The only
 in-game signal is the grid + sparse `levels_completed` (FrameData has NO per-frame score), so goal inference must
