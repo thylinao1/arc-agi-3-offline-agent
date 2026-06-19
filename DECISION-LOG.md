@@ -98,10 +98,34 @@ Newest at the bottom.
       shot up. **Coverage unchanged at 3/25** — the win was EFFICIENCY (the scored Y-axis), not coverage. Dropped
       the greedy `next_move` (it solved nothing); 20/20 tests. `ARC_DEBUG=1` prints `HYPO target=… path=…`.
 
-## NEXT (coverage needs richer goal inference; efficiency on solved games is now good)
-- [ ] **Non-reach-target goals**: the unsolved movement games (ls20, m0r0, wa30, re86…) and puzzle games need goals
-      beyond "reach a tile" — collect-all-of-color, arrange/match, push-block. Infer the goal from what changes at a
-      level-complete event (when BFS/hypo accidentally wins) and generalize it.
+- 2026-06-19 — **Robust arrow detection (semantic fill).** Probe was missing directions blocked at the root (ls20
+      saw only up/left/right; ACTION2/down was mislabeled interact). Fix: trust probed directions, fill gaps from the
+      ACTION1-4 convention (1=up,2=down,3=left,4=right), require ≥2 confirmed cursor moves to avoid false positives.
+      Now ALL movement games get full 4-arrow maps (ls20/m0r0/wa30/re86/cn04/dc22/ka59). **But coverage + score are
+      UNCHANGED (3/25, 0.0843)** — decisive finding: even with correct cursor + 4 arrows + pathfinding + multi-target
+      hypothesis + interact, these games DON'T solve. Their goals are genuinely NOT "reach a colored tile" (ls20
+      pathfinds to its rarest color; reaching it doesn't win). 20/20 tests; no regression; helps blocked-direction
+      games on the hidden set.
+
+- 2026-06-19 — **Collect-all hypothesis + ordering tuning.** Added `plan_collect` (greedy nearest-neighbour tour
+      visiting ALL tiles of a color) as a goal hypothesis alongside reach-one; refactored pathfinding onto shared
+      `_build_logical`/`_bfs`/`_setup_target` helpers. EMPIRICAL: collect adds **0 coverage** on the public set and,
+      interleaved/collect-first, REGRESSED efficiency (0.0843→0.0563). Fix = **all reach hypotheses first, then
+      collect as a last resort**; collect kept for collect-style games on the hidden set. With that ordering + full
+      4-arrow maps (semantic fill) + the representative-tile pick, **aggregate RHAE reached 0.1021** (best yet, ~7×
+      the 0.0144 baseline). 21/21 tests. Lesson: nav efficiency is brittle to target-tile + hypothesis-ordering
+      choices — locked the best-measured config.
+
+## STATUS: bounded heuristics plateaued at 3/25 coverage / 0.1021 RHAE (best).
+The remaining coverage gap is genuine research, not tweaks. Empirically narrowed: the unsolved movement games need
+**non-reach-target goals** (collect-all-of-color, ordered sequence, push-block, multi-tile arrangement). The only
+in-game signal is the grid + sparse `levels_completed` (FrameData has NO per-frame score), so goal inference must
+come from grid structure + diffing the frame at a level-complete event. NEXT, in rough value order:
+- [ ] **Goal-pattern from completion**: when BFS/hypo accidentally wins, diff the pre-win → win frame to learn the
+      goal pattern (what color/shape/arrangement = victory), then drive toward it on later levels & similar games.
+- [ ] **Collect-all detection**: if the cursor removes target tiles on contact, sweep ALL target tiles (TSP-ish),
+      not just the nearest — likely unlocks several movement games.
+- [ ] occam's **combo search** + **deepcopy BFS** for the non-movement puzzle games (vc33/lp85 score low via BFS).
 - [ ] Port occam's remaining solvers: **combo search** (exhaustive short action sequences), **deepcopy BFS**
       (perfect state cloning, no replay cost), **dense click scan** (find ALL effective click positions),
       `_solve_reactive_click`, and **cross-level winning-combo caching** (reuse level-1 solutions on later levels).

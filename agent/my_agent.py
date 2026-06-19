@@ -388,12 +388,16 @@ class ReactiveNav:
     the agent falls back to BFS when no cursor is found or the cursor stalls.
     """
 
+    _SEMANTIC = {"ACTION1": "up", "ACTION2": "down", "ACTION3": "left", "ACTION4": "right"}
+
     def __init__(self) -> None:
         self.bg: Optional[int] = None
         self.cursor_color: Optional[int] = None
         self.arrow_map: dict[str, str] = {}  # direction -> action name
         self.interact: Optional[str] = None
         self.step_sizes: list[float] = []
+        self.probed: dict[str, str] = {}     # action -> probed direction
+        self.moved: set[str] = set()         # actions confirmed to move the cursor
 
     def probe(self, root: np.ndarray, result: np.ndarray, action: str) -> None:
         diff = root != result
@@ -420,15 +424,31 @@ class ReactiveNav:
             self.cursor_color = best
         if self.cursor_color == best:
             d = ("up" if bdy < 0 else "down") if abs(bdy) > abs(bdx) else ("left" if bdx < 0 else "right")
-            self.arrow_map.setdefault(d, action)
+            self.probed[action] = d
+            self.moved.add(action)
             self.step_sizes.append(abs(bdy) + abs(bdx))
 
     def finalize(self, simples: list[str]) -> None:
+        # Trust probed directions; fill gaps from the ACTION1-4 semantic convention so a
+        # direction blocked at the root (never seen moving) is still usable for pathfinding.
+        directionals = [a for a in simples if a in self._SEMANTIC]
+        self.arrow_map = {}
+        for a in directionals:
+            if a in self.probed:
+                self.arrow_map[self.probed[a]] = a
+        for a in directionals:
+            d = self._SEMANTIC[a]
+            if d not in self.arrow_map and a not in self.arrow_map.values():
+                self.arrow_map[d] = a
         used = set(self.arrow_map.values())
-        self.interact = next((a for a in simples if a not in used), None)
+        if "ACTION5" in simples and "ACTION5" not in used:
+            self.interact = "ACTION5"
+        else:
+            self.interact = next((a for a in simples if a not in used), None)
 
     def ready(self) -> bool:
-        return self.cursor_color is not None and len(self.arrow_map) >= 2
+        # Require ≥2 CONFIRMED cursor moves so non-movement games don't false-positive.
+        return self.cursor_color is not None and len(self.moved) >= 2 and len(self.arrow_map) >= 2
 
     def candidate_targets(self, grid: np.ndarray, limit: int = 6) -> list[int]:
         """Distinct non-background, non-cursor colors, rarest first — goal hypotheses."""
@@ -440,13 +460,8 @@ class ReactiveNav:
 
     _DIRS = {"up": (-1, 0), "down": (1, 0), "left": (0, -1), "right": (0, 1)}
 
-    def plan_path(self, grid: np.ndarray, target_color: Optional[int] = None) -> Optional[list[str]]:
-        """Logical-grid BFS pathfinding: cursor → a target color, around walls.
-
-        Tiles the grid by the cursor's step size, treats colors covering >20% as walls, and
-        BFS-searches a directional action path (+ interact). `target_color` selects the goal
-        hypothesis; if None, the rarest color is used. Returns the action-name list, or None.
-        """
+    def _build_logical(self, grid: np.ndarray) -> Optional[tuple]:
+        """Tile the grid by the cursor step size → (logical, gh, gw, cursor_cell, dir→action)."""
         if self.cursor_color is None or len(self.arrow_map) < 2 or self.bg is None:
             return None
         step = max(2, int(round(float(np.median(self.step_sizes)) if self.step_sizes else 4)))
@@ -465,6 +480,31 @@ class ReactiveNav:
             return None
         cc = cpos.mean(0)
         cur = (min(int(cc[0]) // step, gh - 1), min(int(cc[1]) // step, gw - 1))
+        d2a = {self._DIRS[n]: a for n, a in self.arrow_map.items() if n in self._DIRS}
+        return logical, gh, gw, cur, d2a
+
+    def _bfs(self, logical, gh, gw, walls, d2a, start, goal) -> Optional[list[str]]:
+        q: deque[tuple[tuple[int, int], list[str]]] = deque([(start, [])])
+        seen = {start}
+        while q:
+            pos, path = q.popleft()
+            if pos == goal:
+                return path
+            if len(path) > gh * gw * 2:
+                break
+            for (dy, dx), act in sorted(d2a.items()):
+                nr, nc = pos[0] + dy, pos[1] + dx
+                if 0 <= nr < gh and 0 <= nc < gw and (nr, nc) not in seen and int(logical[nr, nc]) not in walls:
+                    seen.add((nr, nc))
+                    q.append(((nr, nc), path + [act]))
+        return None
+
+    def _setup_target(self, grid, target_color):
+        """Shared setup → (logical, gh, gw, cur, d2a, walls, target_cells, target_color)."""
+        built = self._build_logical(grid)
+        if built is None:
+            return None
+        logical, gh, gw, cur, d2a = built
         colors = [int(c) for c in set(logical.ravel().tolist()) if c not in (self.bg, self.cursor_color)]
         if not colors:
             return None
@@ -472,30 +512,52 @@ class ReactiveNav:
         if target_color is None:
             target_color = min(counts, key=lambda c: counts[c])
         elif target_color not in counts:
-            return None  # requested target washed out at logical resolution
-        tpos = np.argwhere(logical == target_color)
-        if len(tpos) == 0:
-            return None
-        tgt = tuple(int(v) for v in tpos[len(tpos) // 2])
-        if cur == tgt:
             return None
         walls = {c for c in colors if c != target_color and counts[c] > max(gh * gw * 0.2, 3)}
-        dir_to_action = {self._DIRS[n]: a for n, a in self.arrow_map.items() if n in self._DIRS}
-        tail = [self.interact] if self.interact else []  # press the target on arrival
-        q: deque[tuple[tuple[int, int], list[str]]] = deque([(cur, [])])
-        seen = {cur}
-        while q:
-            pos, path = q.popleft()
-            if pos == tgt:
-                return path + tail
-            if len(path) > gh * gw * 2:
-                break
-            for (dy, dx), act in sorted(dir_to_action.items()):
-                nr, nc = pos[0] + dy, pos[1] + dx
-                if 0 <= nr < gh and 0 <= nc < gw and (nr, nc) not in seen and int(logical[nr, nc]) not in walls:
-                    seen.add((nr, nc))
-                    q.append(((nr, nc), path + [act]))
-        return None
+        cells = [tuple(int(v) for v in p) for p in np.argwhere(logical == target_color)]
+        return logical, gh, gw, cur, d2a, walls, cells
+
+    def plan_path(self, grid: np.ndarray, target_color: Optional[int] = None) -> Optional[list[str]]:
+        """Path to a representative target tile (+ interact). Goal hypothesis = 'reach a tile'."""
+        s = self._setup_target(grid, target_color)
+        if s is None:
+            return None
+        logical, gh, gw, cur, d2a, walls, cells = s
+        if not cells:
+            return None
+        tgt = cells[len(cells) // 2]  # representative tile (empirically the strongest pick)
+        if cur == tgt:
+            return None
+        p = self._bfs(logical, gh, gw, walls, d2a, cur, tgt)
+        if p is None:
+            return None
+        return p + ([self.interact] if self.interact else [])
+
+    def plan_collect(self, grid: np.ndarray, target_color: Optional[int] = None) -> Optional[list[str]]:
+        """Greedy nearest-neighbour tour visiting ALL target tiles. Goal hypothesis =
+        'collect/sweep all of a color' (also passes through the first tile, so it subsumes
+        reach-one). Returns the concatenated action path, or None."""
+        s = self._setup_target(grid, target_color)
+        if s is None:
+            return None
+        logical, gh, gw, cur, d2a, walls, cells = s
+        remaining = [c for c in cells if c != cur]
+        if len(remaining) < 2:
+            return None  # single tile → plan_path already covers it
+        full: list[str] = []
+        pos = cur
+        while remaining and len(full) <= gh * gw * 4:
+            best_t, best_p = None, None
+            for t in remaining:
+                p = self._bfs(logical, gh, gw, walls, d2a, pos, t)
+                if p is not None and (best_p is None or len(p) < len(best_p)):
+                    best_t, best_p = t, p
+            if best_t is None:
+                break  # unreachable remainder
+            full += best_p
+            pos = best_t
+            remaining.remove(best_t)
+        return full or None
 
 
 # ───────────────────────────────── the agent ──────────────────────────────────────────
@@ -507,7 +569,7 @@ class MyAgent(Agent):  # type: ignore[misc]
     CLICK_BUDGET = 24          # salient click targets per state (coverage > branching savings)
     GIVEUP_PER_LEVEL = 1000    # stop burning actions on a stuck level (≈ the grader's 5x cutoff)
     STEP_MODULUS = 1           # >1 only for known-periodic games (per-game lever, off by default)
-    NAV_CAP = 300              # max goal-hypothesis-search steps before falling back to BFS
+    NAV_CAP = 500              # max goal-hypothesis-search steps before falling back to BFS
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -625,7 +687,13 @@ class MyAgent(Agent):  # type: ignore[misc]
             if self._hypo_targets is None:
                 cands = self._nav.candidate_targets(grid)
                 hint = [self._nav_target_hint] if self._nav_target_hint is not None else []
-                self._hypo_targets = deque(hint + [c for c in cands if c != self._nav_target_hint])
+                colors = hint + [c for c in cands if c != self._nav_target_hint]
+                # ALL reach+interact hypotheses first (efficient on reach-one games), then
+                # collect-all as a true last resort. Interleaving regressed efficiency on the
+                # public set; collect adds 0 coverage there but is kept for the hidden set.
+                self._hypo_targets = deque(
+                    [(c, "reach") for c in colors] + [(c, "collect") for c in colors]
+                )
             return self._start_next_target(grid)
         if self._hypo_path:  # mid-path
             tok = self._hypo_path.popleft()
@@ -635,11 +703,12 @@ class MyAgent(Agent):  # type: ignore[misc]
 
     def _start_next_target(self, root_grid: np.ndarray) -> Any:
         while self._hypo_targets:
-            tc = self._hypo_targets.popleft()
-            path = self._nav.plan_path(root_grid, tc)
+            tc, method = self._hypo_targets.popleft()
+            path = (self._nav.plan_collect(root_grid, tc) if method == "collect"
+                    else self._nav.plan_path(root_grid, tc))
             if path:
                 if _DEBUG:
-                    print(f"[nav] {self.game_id}: HYPO target={tc} path={len(path)}", flush=True)
+                    print(f"[nav] {self.game_id}: HYPO {method} target={tc} path={len(path)}", flush=True)
                 self._hypo_target = tc
                 self._hypo_path = deque(path)
                 tok = self._hypo_path.popleft()

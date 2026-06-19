@@ -199,13 +199,21 @@ def test_search_still_solves_with_pruning_enabled() -> None:
 
 
 # ───────────────────────────── ReactiveNav ─────────────────────────────
-def test_reactive_nav_probe_detects_cursor_and_direction() -> None:
-    root = np.zeros((8, 8), dtype=np.int16); root[2, 2] = 7
-    result = np.zeros((8, 8), dtype=np.int16); result[2, 3] = 7  # cursor moved right
+def test_reactive_nav_probe_plus_semantic_fill() -> None:
     nav = ReactiveNav()
-    nav.probe(root, result, "ACTION4")
+    root = np.zeros((8, 8), dtype=np.int16); root[2, 2] = 7
+    right = np.zeros((8, 8), dtype=np.int16); right[2, 3] = 7  # cursor moved right via ACTION4
+    up = np.zeros((8, 8), dtype=np.int16); up[1, 2] = 7        # cursor moved up via ACTION1
+    nav.probe(root, right, "ACTION4")
+    nav.probe(root, up, "ACTION1")
+    nav.finalize(["ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5"])
     assert nav.cursor_color == 7
-    assert nav.arrow_map.get("right") == "ACTION4"
+    assert nav.arrow_map.get("right") == "ACTION4"   # probed
+    assert nav.arrow_map.get("up") == "ACTION1"      # probed
+    assert nav.arrow_map.get("down") == "ACTION2"    # semantic fill (blocked at root)
+    assert nav.arrow_map.get("left") == "ACTION3"    # semantic fill
+    assert nav.interact == "ACTION5"
+    assert nav.ready() is True                       # 2 confirmed moves
 
 
 def test_reactive_nav_candidate_targets_rarest_first() -> None:
@@ -232,6 +240,20 @@ def test_reactive_nav_plan_path_to_target_with_interact() -> None:
     assert path is not None
     assert path[-1] == "ACTION5"          # interacts on arrival
     assert "ACTION4" in path              # moves right toward the target
+
+
+def test_reactive_nav_plan_collect_visits_all_tiles() -> None:
+    nav = ReactiveNav()
+    nav.cursor_color, nav.bg = 7, 0
+    nav.arrow_map = {"up": "ACTION1", "down": "ACTION2", "left": "ACTION3", "right": "ACTION4"}
+    nav.step_sizes = [2.0]
+    g = np.zeros((8, 8), dtype=np.int16)
+    g[0:2, 0:2] = 7   # cursor at logical (0, 0)
+    g[0:2, 4:6] = 9   # target tile at logical (0, 2)
+    g[6:8, 0:2] = 9   # target tile at logical (3, 0)
+    path = nav.plan_collect(g, target_color=9)
+    assert path is not None and len(path) >= 5   # must reach BOTH tiles, not just the nearest
+    assert all(a in ("ACTION1", "ACTION2", "ACTION3", "ACTION4") for a in path)
 
 
 def test_reactive_nav_not_ready_without_two_arrows() -> None:
