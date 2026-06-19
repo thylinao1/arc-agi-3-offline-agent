@@ -3,30 +3,28 @@ Kaggle submission notebook, so it may import ONLY: stdlib, numpy, arcengine,
 agents.agent).
 
 Strategy (see SPEC.md / CONTRACT.md / DECISION-LOG.md):
-  - No model in the loop. Deterministic, symbolic, offline.
-  - Coverage first: solve as many games/levels as possible (an unsolved level is 0).
+  - No model in the loop. Deterministic, symbolic, offline. Coverage first.
   - Perceive the 64x64 grid as colored objects via connected components (no scipy).
-  - Explore the frontier: try each action once per state, learn which actions are
-    "effective" (change the frame), and prefer untried effective actions.
   - Click object centroids only (ACTION6), collapsing 4096 pixels to a handful.
-  - Level-aware: on level-up, bank effective actions and refresh the per-level frontier.
-  - Deterministic: seeded by game_id only; sorted iteration; no wall-clock, no RNG in
-    the action choice path.
-
-The full reset-and-replay BFS (occam's ReplayExplorer) is the next upgrade; this is a
-better-than-random floor that exercises the whole offline pipeline end to end.
+  - Solve via reset-and-replay DFS (occam's technique): explore the game's reachable
+    states; because the engine is deterministic (confirmed), any state is revisitable by
+    RESET + replaying the action prefix that first reached it. DFS goes deep first (good
+    for reaching goals) and follows the agent's current position, so it resets only on
+    dead-ends / backtracks rather than on every probe.
+  - Level-aware: on level-up, start a fresh per-level search (RESET = level restart, so
+    completed levels are kept).
+  - Deterministic: seeded by nothing wall-clock; sorted iteration; no RNG.
 """
 from __future__ import annotations
 
 import hashlib
-from collections import deque
 from typing import Any, Optional
 
 import numpy as np
 
-# Guarded imports so the pure helpers below stay importable in unit tests without the
-# framework / SDK installed. On Kaggle and in `make play-local` these always resolve.
-try:  # pragma: no cover - exercised on Kaggle / local-dev, not in pure unit tests
+# Guarded imports so the pure helpers + ReplayDFS stay importable in unit tests without
+# the framework / SDK. On Kaggle and in `make play-local` these always resolve.
+try:  # pragma: no cover
     from arcengine import FrameData, GameAction, GameState  # type: ignore
 except Exception:  # pragma: no cover
     FrameData = Any  # type: ignore
@@ -39,15 +37,13 @@ except Exception:  # pragma: no cover
     Agent = object  # type: ignore
 
 GRID_SIZE = 64
-MAX_CLICK_CANDIDATES = 24  # bound ACTION6 branching to the biggest objects
+MAX_CLICK_CANDIDATES = 16  # bound ACTION6 branching to the biggest objects
+RESET = "RESET"
 
 
 # ───────────────────────── pure perception helpers (testable) ─────────────────────────
 def grid_from_frame(frame: Any) -> np.ndarray:
-    """Return the current 64x64 observation as an int array.
-
-    FrameData.frame is a list of 64x64 grids; the last one is the current screen.
-    """
+    """Return the current 64x64 observation as an int array (last grid in the stack)."""
     if frame is None:
         return np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.int16)
     arr = np.asarray(frame[-1] if len(frame) else frame, dtype=np.int16)
@@ -56,16 +52,41 @@ def grid_from_frame(frame: Any) -> np.ndarray:
     return arr
 
 
-def frame_signature(grid: np.ndarray) -> str:
-    """Stable short hash of a grid (deterministic, fast)."""
+def frame_signature(grid: np.ndarray, mask: Optional[np.ndarray] = None) -> str:
+    """Stable short hash of a grid (deterministic, fast).
+
+    If `mask` is given, masked cells are zeroed before hashing so volatile counter /
+    status-bar pixels don't make every frame look like a new state.
+    """
+    if mask is not None:
+        grid = np.where(mask, np.int16(0), grid)
     return hashlib.md5(np.ascontiguousarray(grid).tobytes()).hexdigest()[:16]
+
+
+def volatility_mask(grids: list[np.ndarray], max_fraction: float = 0.10) -> Optional[np.ndarray]:
+    """Detect counter/status-bar pixels: cells that change on EVERY warmup transition.
+
+    A move counter increments each step (changes every transition); the player/objects
+    change only on effective moves (not every transition). We mask only the always-changing
+    cells, and bail out (return None) if that region is large (>max_fraction) — that means
+    the play area itself is animating and masking would erase real state.
+    """
+    if len(grids) < 2:
+        return None
+    stack = np.stack(grids)
+    diffs = stack[1:] != stack[:-1]
+    always = diffs.all(axis=0)
+    n = int(always.sum())
+    if 0 < n <= max_fraction * always.size:
+        return always
+    return None
 
 
 def connected_components(grid: np.ndarray) -> list[dict[str, Any]]:
     """4-connected same-color components over non-zero cells (background = 0).
 
-    Pure numpy + BFS, no scipy. Returns components sorted by descending size, then by
-    position, for deterministic ordering. Each component: {color, size, centroid (y,x)}.
+    Pure numpy + iterative BFS, no scipy. Sorted by descending size then position for
+    deterministic ordering. Each component: {color, size, centroid (y, x)}.
     """
     h, w = grid.shape
     seen = np.zeros((h, w), dtype=bool)
@@ -75,17 +96,17 @@ def connected_components(grid: np.ndarray) -> list[dict[str, Any]]:
             color = int(grid[y, x])
             if color == 0 or seen[y, x]:
                 continue
-            q: deque[tuple[int, int]] = deque([(y, x)])
+            stack = [(y, x)]
             seen[y, x] = True
             cells: list[tuple[int, int]] = []
-            while q:
-                cy, cx = q.popleft()
+            while stack:
+                cy, cx = stack.pop()
                 cells.append((cy, cx))
                 for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                     ny, nx = cy + dy, cx + dx
                     if 0 <= ny < h and 0 <= nx < w and not seen[ny, nx] and int(grid[ny, nx]) == color:
                         seen[ny, nx] = True
-                        q.append((ny, nx))
+                        stack.append((ny, nx))
             ys = [c[0] for c in cells]
             xs = [c[1] for c in cells]
             comps.append(
@@ -114,142 +135,223 @@ def click_candidates(grid: np.ndarray, limit: int = MAX_CLICK_CANDIDATES) -> lis
     return out
 
 
-# ───────────────────────── exploration policy (testable core) ─────────────────────────
-class FrontierPolicy:
-    """Per-state frontier exploration over discrete action keys.
+# ─────────────────────── reset-and-replay DFS solver (testable) ────────────────────────
+class ReplayDFS:
+    """Step-wise depth-first reset-and-replay search over discrete action tokens.
 
-    Action keys are strings: "ACTION1".."ACTION5" for simple actions and
-    "ACTION6:x,y" for clicks. Pure Python, deterministic, no GameAction dependency.
+    Tokens are strings: "ACTION1".."ACTION5" and "ACTION6:x,y" for clicks; "RESET" is
+    reserved. The driver calls `step()` once per real environment turn with the observed
+    state signature + the candidate tokens legal there, and applies the returned token.
+
+    Invariants (rely on confirmed determinism):
+      - `known[sig]` is the action prefix (no RESET) from the level root to `sig`.
+      - To probe an untried token from a target state we reposition there incrementally
+        (replay the unseen suffix) when the current state is an ancestor, else RESET +
+        full replay. DFS keeps the current state == target most of the time → few resets.
     """
 
     def __init__(self) -> None:
+        self.root: Optional[str] = None
+        self.known: dict[str, list[str]] = {}
+        self.by_prefix: dict[tuple[str, ...], str] = {}
+        self.cand: dict[str, list[str]] = {}
         self.tried: dict[str, set[str]] = {}
-        self.transitions: dict[tuple[str, str], str] = {}
-        self.effective: set[str] = set()
-        self.last_sig: Optional[str] = None
-        self.last_key: Optional[str] = None
-        self.level: int = 0
-        self.actions_this_level: int = 0
-        self.consecutive_exhausted: int = 0
+        self.terminal: set[str] = set()
+        self.expanding: Optional[str] = None
+        self.plan: list[str] = []
+        self.awaiting: Optional[tuple[str, str]] = None
+        self.cur: Optional[str] = None
 
-    def on_level_change(self, new_level: int) -> None:
-        """Bank effective actions; refresh the per-level frontier for the new level."""
-        self.level = new_level
-        self.tried.clear()
-        self.transitions.clear()
-        self.last_sig = None
-        self.last_key = None
-        self.actions_this_level = 0
-        self.consecutive_exhausted = 0
+    # -- level lifecycle ---------------------------------------------------------------
+    def start_level(self, sig: str, candidates: list[str]) -> None:
+        self.root = sig
+        self.known = {sig: []}
+        self.by_prefix = {(): sig}
+        self.cand = {sig: list(candidates)}
+        self.tried = {}
+        self.terminal = set()
+        self.expanding = sig
+        self.plan = []
+        self.awaiting = None
+        self.cur = sig
 
-    def observe(self, sig: str) -> None:
-        """Record the result of the previous action: transition + effective flag."""
-        if self.last_sig is not None and self.last_key is not None:
-            self.transitions[(self.last_sig, self.last_key)] = sig
-            if sig != self.last_sig:
-                self.effective.add(self.last_key)
+    def note_reset(self) -> None:
+        """Called when the env reports NOT_PLAYED — clear in-flight plan/awaiting."""
+        self.plan = []
+        self.awaiting = None
+        self.cur = None
 
-    def select(self, sig: str, simple_keys: list[str], click_keys: list[str]) -> str:
-        """Pick the next action key from `sig`. Returns a key or "RESET" to escape."""
-        tried = self.tried.setdefault(sig, set())
+    # -- the per-turn decision ---------------------------------------------------------
+    def step(self, sig: str, candidates: list[str], game_over: bool = False) -> str:
+        if self.root is None:
+            self.start_level(sig, candidates)
+            return self._next_probe()
 
-        def first_untried(keys: list[str]) -> Optional[str]:
-            for k in keys:
-                if k not in tried:
-                    return k
-            return None
+        if game_over:
+            if self.awaiting is not None:
+                e, t = self.awaiting
+                if sig not in self.known:
+                    self.known[sig] = self.known[e] + [t]
+                    self.by_prefix[tuple(self.known[sig])] = sig
+                self.terminal.add(sig)
+                self.awaiting = None
+            self.plan = []
+            self.cur = None
+            return RESET
 
-        # 1) untried effective simple actions, 2) untried simple, 3) untried clicks.
-        ordered_simple = [k for k in simple_keys if k in self.effective] + [
-            k for k in simple_keys if k not in self.effective
-        ]
-        choice = first_untried(ordered_simple) or first_untried(click_keys)
+        if self.awaiting is not None:
+            e, t = self.awaiting
+            is_new = sig not in self.known
+            if is_new:
+                self.known[sig] = self.known[e] + [t]
+                self.by_prefix[tuple(self.known[sig])] = sig
+                self.cand[sig] = list(candidates)
+            self.awaiting = None
+            self.cur = sig
+            # DFS: descend into genuinely new, non-terminal states; else stay on `e`.
+            self.expanding = sig if (is_new and sig not in self.terminal) else e
+        else:
+            self.cur = sig
+            self.cand.setdefault(sig, list(candidates))
 
-        if choice is None:
-            # State exhausted and non-terminal: reset to re-branch from the start.
-            self.consecutive_exhausted += 1
-            self.last_sig = None
-            self.last_key = None
-            return "RESET"
+        if self.plan:
+            return self._emit()
+        return self._next_probe()
 
-        self.consecutive_exhausted = 0
-        tried.add(choice)
-        self.last_sig = sig
-        self.last_key = choice
-        self.actions_this_level += 1
-        return choice
+    # -- internals ---------------------------------------------------------------------
+    def _emit(self) -> str:
+        tok = self.plan.pop(0)
+        if not self.plan and self.expanding is not None:
+            self.awaiting = (self.expanding, tok)
+        return tok
+
+    def _untried(self, sig: str) -> list[str]:
+        done = self.tried.setdefault(sig, set())
+        return [c for c in self.cand.get(sig, []) if c not in done]
+
+    def _next_probe(self) -> str:
+        # Find a state with untried tokens, backtracking up the DFS tree as needed.
+        while True:
+            if self.expanding is None:
+                return RESET  # exhausted: restart and keep trying within the budget
+            ut = self._untried(self.expanding)
+            if ut:
+                break
+            if self.expanding == self.root:
+                self.expanding = None
+                return RESET
+            parent = self.by_prefix.get(tuple(self.known[self.expanding][:-1]))
+            self.expanding = parent
+            if parent is None:
+                return RESET
+
+        token = ut[0]
+        self.tried[self.expanding].add(token)
+        target_prefix = self.known[self.expanding]
+
+        if self.cur == self.expanding:
+            self.plan = [token]
+        elif self.cur is not None and _is_prefix(self.known.get(self.cur, ["x"]), target_prefix):
+            self.plan = target_prefix[len(self.known[self.cur]):] + [token]
+        else:
+            self.plan = [RESET] + target_prefix + [token]
+        return self._emit()
+
+
+def _is_prefix(p: list[str], q: list[str]) -> bool:
+    return len(p) <= len(q) and q[: len(p)] == p
 
 
 # ───────────────────────────────── the agent ──────────────────────────────────────────
 class MyAgent(Agent):  # type: ignore[misc]
-    """Deterministic offline frontier explorer."""
+    """Deterministic offline reset-and-replay DFS solver."""
 
-    MAX_ACTIONS = 600  # generous per-game cap; the grader enforces the real ~5x cutoff
+    MAX_ACTIONS = 1000   # generous per-game cap; the grader enforces the real ~5x cutoff
+    WARMUP_STEPS = 8     # frames to gather before freezing the counter mask
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self._policy = FrontierPolicy()
+        self._level = 0
+        self._reset_level()
+
+    def _reset_level(self) -> None:
+        self._dfs = ReplayDFS()
+        self._mask: Optional[np.ndarray] = None
+        self._warm: list[np.ndarray] = []
+        self._frozen = False
 
     @property
     def name(self) -> str:
         return f"{super().name}.{self.MAX_ACTIONS}"
 
     def is_done(self, frames: list[Any], latest_frame: Any) -> bool:
-        # Stop only on a win; on GAME_OVER we RESET and keep exploring.
         return latest_frame.state is GameState.WIN
 
     def choose_action(self, frames: list[Any], latest_frame: Any) -> Any:
-        # First contact or a death → reset the level.
-        if latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER):
-            self._policy.last_sig = None
-            self._policy.last_key = None
+        state = latest_frame.state
+        if state is GameState.NOT_PLAYED:
+            self._dfs.note_reset()
             return GameAction.RESET
 
-        # Level-up: bank knowledge, refresh the frontier.
-        if latest_frame.levels_completed > self._policy.level:
-            self._policy.on_level_change(latest_frame.levels_completed)
+        if latest_frame.levels_completed > self._level:
+            self._level = latest_frame.levels_completed
+            self._reset_level()
 
         grid = grid_from_frame(latest_frame.frame)
-        sig = frame_signature(grid)
-        self._policy.observe(sig)
 
-        simple_keys, click_keys, complex_action = self._candidate_keys(latest_frame, grid)
-        key = self._policy.select(sig, simple_keys, click_keys)
+        # Warmup: gather frames, then freeze the volatility mask and restart at root.
+        if not self._frozen:
+            if state is GameState.GAME_OVER:
+                return GameAction.RESET
+            self._warm.append(grid)
+            if len(self._warm) >= self.WARMUP_STEPS:
+                self._mask = volatility_mask(self._warm)
+                self._frozen = True
+                self._dfs = ReplayDFS()
+                return GameAction.RESET
+            return self._warmup_action(latest_frame, grid, len(self._warm))
 
-        if key == "RESET":
+        sig = frame_signature(grid, self._mask)
+        candidates = self._candidates(latest_frame, grid)
+        token = self._dfs.step(sig, candidates, game_over=state is GameState.GAME_OVER)
+        return self._to_action(token)
+
+    def _warmup_action(self, latest_frame: Any, grid: np.ndarray, i: int) -> Any:
+        """Cycle the simple actions to provoke frame changes during warmup."""
+        simples = [t for t in self._candidates(latest_frame, grid) if not t.startswith("ACTION6:")]
+        if not simples:
             return GameAction.RESET
-        if key.startswith("ACTION6:"):
-            x, y = (int(v) for v in key.split(":", 1)[1].split(","))
-            action = complex_action if complex_action is not None else GameAction.ACTION6
-            action.set_data({"x": x, "y": y})
-            action.reasoning = {"why": "centroid click", "x": x, "y": y}
-            return action
-        action = GameAction.from_name(key) if hasattr(GameAction, "from_name") else getattr(GameAction, key)
-        action.reasoning = {"why": "frontier simple action"}
-        return action
+        return self._to_action(simples[i % len(simples)])
 
-    def _candidate_keys(
-        self, latest_frame: Any, grid: np.ndarray
-    ) -> tuple[list[str], list[str], Any]:
-        """Build (simple_keys, click_keys, complex_action) from available actions."""
+    # -- token <-> GameAction ----------------------------------------------------------
+    def _candidates(self, latest_frame: Any, grid: np.ndarray) -> list[str]:
         available = getattr(latest_frame, "available_actions", None)
         if not available:
             available = [a for a in GameAction]  # type: ignore[union-attr]
-        # `available_actions` arrives as action ids (ints) at runtime; normalize to GameAction.
         available = [GameAction.from_id(a) if isinstance(a, int) else a for a in available]
 
-        simple_keys: list[str] = []
-        complex_action: Any = None
+        simple: list[str] = []
+        has_click = False
         for a in available:
             if a is GameAction.RESET:
                 continue
             if a.is_complex():
-                complex_action = a
+                has_click = True
             else:
-                simple_keys.append(a.name)
-        simple_keys.sort()
+                simple.append(a.name)
+        simple.sort()
+        clicks = [f"ACTION6:{x},{y}" for (x, y) in click_candidates(grid)] if has_click else []
+        return simple + clicks
 
-        click_keys: list[str] = []
-        if complex_action is not None:
-            click_keys = [f"ACTION6:{x},{y}" for (x, y) in click_candidates(grid)]
-        return simple_keys, click_keys, complex_action
+    def _to_action(self, token: str) -> Any:
+        if token == RESET:
+            return GameAction.RESET
+        if token.startswith("ACTION6:"):
+            x, y = (int(v) for v in token.split(":", 1)[1].split(","))
+            action = GameAction.ACTION6
+            action.set_data({"x": x, "y": y})
+            action.reasoning = {"why": "centroid click", "x": x, "y": y}
+            return action
+        action = getattr(GameAction, token)
+        action.reasoning = {"why": "dfs probe"}
+        return action

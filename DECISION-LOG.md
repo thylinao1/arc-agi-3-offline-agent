@@ -38,13 +38,36 @@ Newest at the bottom.
   `GameAction`; normalized via `GameAction.from_id`. (CONTRACT.md "list[GameAction]" was the documented type;
   runtime is ids.)
 
+- 2026-06-19 — **API key wired** (user registered + provided two keys; using `c2df11…`, the other is spare).
+  Stored in gitignored `.env` (perms 600). The auto-fetched anonymous key already gives 25 local NORMAL-mode games.
+- 2026-06-19 — **Solver upgraded: occam's reset-and-replay ported as a step-wise DFS** (`ReplayDFS` in
+  my_agent.py). Validated on simulated deterministic graphs (solves deep paths, descends without needless resets,
+  backtracks, handles unsolvable). 13/13 unit tests pass.
+- 2026-06-19 — **Counter/status-bar masking added** (`volatility_mask`): a short warmup masks cells that change on
+  EVERY transition (a counter), keeping the play area. Helped (ACTION3/4 now appear) but insufficient on ls20 etc.
+- 2026-06-19 — **HONEST BASELINE: 0 levels solved** across ls20/ft09/vc33/tn36 (≤400 steps). Root cause:
+  state-dedup still fails — the play area animates enough that the generic mask bails, so the DFS sees every frame
+  as "new" and degenerately descends via ACTION1 instead of exploring breadth. This is the real frontier; occam
+  reaches 57.6% only with per-game counter detection + priority-tier action ranking, and still solves just 17/25.
+- 2026-06-19 — **ls20 human baselines (from scorecard) ≈ [84, 96, 192, 186, …] over 7 levels.** So the 5× cutoff
+  (~420 on level 1) is generous; the gap is solver quality, not budget.
+
 ## OPEN — day-1/3 experiments that gate the architecture (run via experiments/)
-- [ ] **Reset-counting (GO/NO-GO):** does the grader's per-level action count reflect BEST / LAST / CUMULATIVE
-      attempt, and do actions accumulate across resets toward the 5× cutoff? → `experiments/reset_counting.py`.
-      Default to minimize-first-exposure unless this cleanly proves reset zeros/best-selects. (Needs ONLINE mode +
-      ARC_API_KEY for the authoritative grader; local scaffold ready.)
+- [~] **Reset-counting (GO/NO-GO): INCONCLUSIVE** (2026-06-19) — ran `experiments/reset_counting.py` with the key;
+      it exposed the scorecard schema (`level_actions`, `level_baseline_actions`, `resets` tracked separately from
+      `actions`) but could NOT resolve best/last/cumulative because the scripted agent solved 0 levels (no scored
+      level to read). Needs a working solver to complete a level cleanly vs wastefully. Default stands:
+      minimize-first-exposure (occam counts cumulatively and still works).
 - [x] **Determinism: CONFIRMED ✓** (2026-06-18) — `experiments/determinism.py --game ls20 --steps 40`: identical
       frame signatures across two replays. Open-loop replay is safe → exact hash-keyed transition table is valid.
+
+## NEXT (the actual competition work — port occam's solving machinery)
+- [ ] **Per-game counter detection** (not a generic volatility heuristic): port occam's `counter_mask` derivation
+      so state-dedup works on animated games. This is the #1 blocker to any solves.
+- [ ] **Priority-tier action ranking** (occam `priority_tiers.py` + `action_ranker.py`): rank which actions/clicks
+      are worth probing first instead of always-ACTION1-first.
+- [ ] **Give-up budget** (occam `rhae.compute_giveup_budget`) wired into the DFS to bound per-level exploration.
+- [ ] Re-run the reset-counting experiment once a level is solvable, to settle the architecture fork empirically.
 - [ ] **First-exposure cost vs 5× cutoff:** measure naive solve cost vs the give-up budget on 2–3 public games.
 - [ ] **Offline audit:** grep `agent/my_agent.py` for `requests|urllib|httpx|huggingface_hub|torch.hub|socket`;
       run the notebook with internet disabled locally before submitting.
