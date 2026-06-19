@@ -6,7 +6,13 @@ Authoritative "where things are" for a fresh conversation. Read this + `DECISION
 A **hybrid, fully-offline, deterministic ARC-AGI-3 agent** for the ARC Prize 2026 Kaggle track
 (`arc-prize-2026-arc-agi-3`, $850K, Milestone #1 = 2026-06-30). It solves **9/25 public games** — the best
 Kaggle-portable result we reached. Everything is committed, tested (21/21), and **submission-ready** (token +
-username wired, notebook built for CPU). Only `make submit` remains, and it's an explicit user action.
+username wired, notebook built for CPU).
+
+**As of 2026-06-19, this session:** the repo is **open-sourced** (public, MIT) at
+**https://github.com/thylinao1/arc-agi-3-offline-agent** — done before any private scores, so milestone
+eligibility is locked. The Kaggle kernel `maksimsilchenko/arc-prize-2026-arc-agi-3-starter` (v1) has been pushed
+via `make submit` and its commit run reached **COMPLETE** (valid `submission.parquet`). The ONLY remaining step is
+a **user action**: click **Submit** on the notebook to trigger Phase B (the hidden-game eval → leaderboard score).
 
 ## The agent (how it plays) — `agent/my_agent.py`
 `MyAgent.main()` runs a hybrid, in priority order, all reset-replay (no internet, no LLM, no GPU):

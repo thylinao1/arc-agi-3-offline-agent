@@ -171,3 +171,15 @@ come from grid structure + diffing the frame at a level-complete event. NEXT, in
 - [ ] **First-exposure cost vs 5× cutoff:** measure naive solve cost vs the give-up budget on 2–3 public games.
 - [ ] **Offline audit:** grep `agent/my_agent.py` for `requests|urllib|httpx|huggingface_hub|torch.hub|socket`;
       run the notebook with internet disabled locally before submitting.
+
+- 2026-06-19 — **OPEN-SOURCED + KAGGLE KERNEL PUSHED (milestone-eligibility locked).** (1) Verified git history
+      clean (11 commits): `.env`/`.kaggle` never tracked; ARC key + Kaggle token never in any commit; no real
+      GitHub/AWS/Slack/private-key token patterns anywhere — only placeholders (`ghp_xxx`, `ARC_API_KEY=test-key-123`).
+      Pushed the MIT repo (occam attributed in NOTICE) to **public GitHub: github.com/thylinao1/arc-agi-3-offline-agent**
+      (25 tracked files; vendor/.env/.kaggle/environment_files all gitignored → absent on remote). Done BEFORE any
+      private scores, per the eligibility rule. (2) **Offline audit DONE** (last open item): zero network imports/URL
+      literals in `my_agent.py` + `occam_bundle.py`. (3) Built the notebook (6 cells, splice verified — MyAgent +
+      occam_bundle + skip_deepcopy embedded) and ran `make submit` → Kaggle kernel
+      `maksimsilchenko/arc-prize-2026-arc-agi-3-starter` v1 pushed; commit run reached **COMPLETE** (offline wheel
+      install clean; emitted valid `submission.parquet`). Remaining step is the USER clicking **Submit** on the
+      notebook to trigger Phase B (the hidden-game gateway rerun that produces the leaderboard score).
