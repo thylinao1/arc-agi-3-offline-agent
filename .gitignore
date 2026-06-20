@@ -26,3 +26,6 @@ reference/
 
 # Trained student weights (shipped as a Kaggle dataset, not via git)
 models/
+
+# Local copy of weights staged for the Kaggle dataset
+kaggle_weights_dataset/

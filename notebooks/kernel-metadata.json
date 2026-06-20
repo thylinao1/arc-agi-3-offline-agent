@@ -10,7 +10,9 @@
   "enable_internet": false,
   "machine_shape": "NvidiaTeslaT4",
   "keywords": [],
-  "dataset_sources": [],
+  "dataset_sources": [
+    "maksimsilchenko/arc-agi3-student-weights"
+  ],
   "kernel_sources": [],
   "competition_sources": [
     "arc-prize-2026-arc-agi-3"
