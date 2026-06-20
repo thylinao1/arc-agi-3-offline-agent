@@ -108,6 +108,7 @@ def main() -> None:
     ap.add_argument("--aug", type=int, default=8)
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--resume", action="store_true", help="continue from existing --out weights")
     args = ap.parse_args()
 
     _roundtrip_check()
@@ -119,6 +120,10 @@ def main() -> None:
     Yt = torch.from_numpy(Y).to(dev)
 
     model = ActionModel(input_channels=NUM_COLOURS, grid_size=GRID).to(dev)
+    if args.resume and Path(args.out).exists():
+        ckpt = torch.load(args.out, map_location=dev)
+        model.load_state_dict(ckpt.get("state_dict", ckpt))
+        print(f"resumed from {args.out}")
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     n = len(Y)
     for epoch in range(args.epochs):
@@ -142,12 +147,17 @@ def main() -> None:
                     pred = model(xb).argmax(1).cpu().numpy()
                     accs.append(pred == Y[s:s + 256])
                 acc = np.concatenate(accs).mean()
-            print(f"epoch {epoch:3d}  loss {tot/n:.4f}  train-acc {acc:.3f}")
+            print(f"epoch {epoch:3d}  loss {tot/n:.4f}  train-acc {acc:.3f}", flush=True)
+            # Checkpoint periodically so an interrupted run isn't wasted.
+            if epoch % 10 == 0 or epoch == args.epochs - 1:
+                save(model, args.out)
+                print(f"  [checkpoint @ epoch {epoch}]", flush=True)
 
-    out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
+
+def save(model, out_path):
+    out = Path(out_path); out.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"state_dict": model.state_dict(),
                 "arch": {"input_channels": NUM_COLOURS, "grid_size": GRID}}, out)
-    print(f"saved student weights -> {out} ({out.stat().st_size/1e3:.1f} kB)")
 
 
 if __name__ == "__main__":

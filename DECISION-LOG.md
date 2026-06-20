@@ -242,3 +242,13 @@ come from grid structure + diffing the frame at a level-complete event. NEXT, in
       deepen the dataset + test whether depth is timeout-bound. Real lever for Track-2 depth: informed search (the
       solver may read game hidden state OFFLINE) instead of plain BFS. occam-based gen_demos is dead; current
       gen_demos.py uses the genuine BFSSolver teacher (reference/teacher_agentv15.py, gitignored).
+
+- 2026-06-20 — **HONEST STUDENT TRAINED + PACKAGED + PUSHED (v3).** Completed the imitation pipeline: trained the
+      student (behavior cloning on 93 demos × 8 color-aug = 837 samples; resumable checkpointing; final train-acc
+      0.987 on CPU). agent/my_agent.py warm-starts from the weights (_load_pretrained) then learns online — plays
+      HONESTLY (no source access). Packaged weights (137MB) as Kaggle dataset maksimsilchenko/arc-agi3-student-weights
+      (ready), wired via kernel-metadata dataset_sources; my_agent loads /kaggle/input/arc-agi3-student-weights/
+      student.pt. Pushed kernel v3 (GPU T4 + weights dataset). Commit run polling. REMAINING: user submits a slot →
+      Phase B → the real number (does imitation warm-start beat our 0.08 / the 0.25 base?). Expectation: genuine
+      prize-eligible entry, NOT >0.66 (data ceiling confirmed). Dead end recorded: occam (fake solves) + MultiSolver
+      (no better coverage). gen_demos uses the genuine BFSSolver teacher (reference/, gitignored).
