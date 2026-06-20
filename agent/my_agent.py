@@ -119,7 +119,7 @@ class ActionModel(nn.Module):
 
         # Action head
         action_features = self.action_pool(conv_features)
-        action_features = action_features.view(action_features.size(0), -1)
+        action_features = action_features.reshape(action_features.size(0), -1)
         action_features = F.relu(self.action_fc(action_features))
         action_features = self.dropout(action_features)
         action_logits = self.action_head(action_features)
@@ -129,7 +129,7 @@ class ActionModel(nn.Module):
         coord_features = F.relu(self.coord_conv2(coord_features))
         coord_features = F.relu(self.coord_conv3(coord_features))
         coord_logits = self.coord_conv4(coord_features)
-        coord_logits = coord_logits.view(coord_logits.size(0), -1)
+        coord_logits = coord_logits.reshape(coord_logits.size(0), -1)
 
         combined_logits = torch.cat([action_logits, coord_logits], dim=1)
         return combined_logits

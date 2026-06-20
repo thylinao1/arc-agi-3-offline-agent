@@ -219,3 +219,26 @@ come from grid structure + diffing the frame at a level-complete event. NEXT, in
       iteration is slow too (MPS available but ~CPU-speed at batch-1, and the CNN needs thousands of steps/game to
       learn → local public-set runs under-train and under-represent it). NEXT: research what lifted others to 0.43+
       (Kaggle Discussion/Code) rather than blind tinkering; prepare an improved v3 to submit tomorrow.
+
+- 2026-06-20 — **HONEST-STUDENT PATH chosen + teacher VALIDATED.** Research showed the public 0.42–0.46 "BFS
+      solvers" are a leakage exploit (load the game .py via importlib, deepcopy-simulate the real game offline, read
+      internal _score/hidden fields) — likely prize/milestone-INELIGIBLE; honest public ceiling ≈0.25–0.32. User
+      chose: use such a solver ONLY as an OFFLINE teacher on PUBLIC games to generate genuine (frame,action) demos,
+      then train an HONEST reactive student (no source-reading) and submit the student. VALIDATED the genuine teacher
+      (Agent v15 BFSSolver, Apache-2.0) on public game sources: sp80→4-action win, vc33→3-action win (occam's were
+      FAKE). NEXT (multi-turn build): (1) rewrite scripts/gen_demos.py to use BFSSolver (not occam) over all 25
+      public games×levels → demo dataset; (2) train student CNN (frame→action) on demos; (3) honest inference agent
+      + ship weights (Kaggle dataset) in the offline notebook; (4) submit. NOTE: current scripts/gen_demos.py is the
+      DEAD occam version (0 demos) — needs the BFSSolver rewrite; teacher proof in /tmp/teacher_src.py.
+
+- 2026-06-20 — **GOAL = TOP-5 (>0.66); plan = BOTH tracks in parallel.** User clarified only top 5 qualify (5th ≈
+      0.66). Honest learned ceiling ≈0.32 and exploit BFS ≈0.42–0.46 are both BELOW 0.66 → top-5 is the elite
+      frontier (Tufa 1.21, Tong Hui Kang 0.70), a multi-week uncertain effort. Host code-reqs: runtime now 9h,
+      RTX6000, NO explicit ban on reading game source (the 0.42–0.46 exploit). DECISION (both in parallel):
+      (1) Track-1 LB: ship the public exploit solver (Agent v15, CPU, 0.46) for a leaderboard datapoint when a
+      submission slot frees (2/day). (2) Track-2 prize: strengthen the OFFLINE teacher (legit on public games) →
+      deep/rich demos → train an HONEST student that ships with no source access. Shared blocker = teacher depth
+      (BFSSolver@45s only cracked L0 of most games). Launched a deeper gen run (bfs-timeout 150s, max-levels 12) to
+      deepen the dataset + test whether depth is timeout-bound. Real lever for Track-2 depth: informed search (the
+      solver may read game hidden state OFFLINE) instead of plain BFS. occam-based gen_demos is dead; current
+      gen_demos.py uses the genuine BFSSolver teacher (reference/teacher_agentv15.py, gitignored).

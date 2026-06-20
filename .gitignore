@@ -23,3 +23,6 @@ reference/
 .DS_Store
 .idea/
 .vscode/
+
+# Trained student weights (shipped as a Kaggle dataset, not via git)
+models/
