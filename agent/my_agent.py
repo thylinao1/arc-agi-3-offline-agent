@@ -212,6 +212,29 @@ class MyAgent(Agent):
         """Get score from frame, compatible with both patched and standard FrameData."""
         return getattr(frame, 'score', None) or frame.levels_completed
 
+    def _load_pretrained(self):
+        """Imitation warm-start: load behavior-cloned weights if shipped, else stay
+        random (pure online learning). The student then keeps learning online — the
+        demos give a prior; online adaptation handles novel hidden games. The agent
+        plays HONESTLY: it never reads game source/internals, only this learned policy."""
+        candidates = [
+            os.environ.get("STUDENT_WEIGHTS", ""),
+            "/kaggle/input/arc-agi3-student-weights/student.pt",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "student.pt"),
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models", "student.pt"),
+        ]
+        for path in candidates:
+            if path and os.path.exists(path):
+                try:
+                    ckpt = torch.load(path, map_location=self.device)
+                    sd = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+                    self.action_model.load_state_dict(sd)
+                    print(f"Warm-started action model from {path}")
+                    return
+                except Exception as e:
+                    print(f"Pretrained load failed ({path}): {e}")
+        print("No pretrained weights found; random init (pure online learning).")
+
     def _sample_from_combined_output(self, combined_logits, available_actions=None):
         """Sample from combined 5 + 64x64 action space with masking for invalid actions."""
         action_logits = combined_logits[:5]
@@ -346,6 +369,7 @@ class MyAgent(Agent):
                 # Create the model lazily on the FIRST level; keep it warm thereafter.
                 if self.action_model is None:
                     self.action_model = ActionModel(input_channels=self.num_colours, grid_size=self.grid_size).to(self.device)
+                    self._load_pretrained()  # imitation warm-start if weights shipped; else random (pure online)
                     self.optimizer = optim.Adam(self.action_model.parameters(), lr=0.0001)
                     print("Initialised action model")
                 else:
