@@ -211,3 +211,11 @@ come from grid structure + diffing the frame at a level-complete event. NEXT, in
       (CPU ~1 fps → GPU needed, hence T4). Notebook rebuilt (5 cells, no occam, torch+ActionModel embedded).
       VALIDATION GAP: local CPU is too slow to confirm scoring; confidence rests on the proven sample (0.43) +
       correct integration. Phase B on the T4 is the real test. NEXT: resubmit, confirm nonzero leaderboard score.
+
+- 2026-06-20 — **REACTIVE CNN SCORED 0.08 (off zero ✓).** v2 Phase B completed: publicScore **0.08** (was 0.00).
+      The reactive paradigm works on the hidden set. Context: leaderboard 1st=1.24, the StochasticGoose frontier
+      band=0.43–0.70; **0.08 is roughly the BASE sample's level** — the 0.43 entries are heavily-iterated versions.
+      Feedback-loop reality: Kaggle rerun ≈4–8h (the agent self-caps at 8h; MAX_ACTIONS=inf) + 5 subs/day; local
+      iteration is slow too (MPS available but ~CPU-speed at batch-1, and the CNN needs thousands of steps/game to
+      learn → local public-set runs under-train and under-represent it). NEXT: research what lifted others to 0.43+
+      (Kaggle Discussion/Code) rather than blind tinkering; prepare an improved v3 to submit tomorrow.

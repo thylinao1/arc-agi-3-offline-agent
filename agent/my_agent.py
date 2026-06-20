@@ -152,7 +152,13 @@ class MyAgent(Agent):
         self.start_time = time.time()
 
         # Device configuration
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # cuda on Kaggle (T4); mps lets local Mac dev use the Metal GPU; else cpu.
+        if torch.cuda.is_available():
+            self.device = torch.device('cuda')
+        elif torch.backends.mps.is_available():
+            self.device = torch.device('mps')
+        else:
+            self.device = torch.device('cpu')
         print(f"Action agent using device: {self.device}")
 
         # Setup experiment directory and logging
@@ -328,14 +334,22 @@ class MyAgent(Agent):
                 self.logger.info(f"Score changed from {self.current_score} to {current_level} at action {self.action_counter}")
                 print(f"Score changed from {self.current_score} to {current_level} at action {self.action_counter}")
 
+                # Clear the experience buffer (old-level layouts/clicks don't apply to the
+                # new level) but KEEP the model + optimizer warm. Within a game the control
+                # scheme (which actions move/click, what a frame-change looks like) is usually
+                # consistent across levels; the base sample re-initialised the CNN every level,
+                # which threw that away and forced re-learning from scratch — wasted actions on
+                # exactly the later levels RHAE weights most. Persisting the weights warm-starts
+                # each new level. (v3 hypothesis — see DECISION-LOG 2026-06-20.)
                 self.experience_buffer.clear()
                 self.experience_hashes.clear()
-                print("Cleared experience buffer - new level reached")
-
-                # Reset network and optimizer for new level
-                self.action_model = ActionModel(input_channels=self.num_colours, grid_size=self.grid_size).to(self.device)
-                self.optimizer = optim.Adam(self.action_model.parameters(), lr=0.0001)
-                print("Reset action model and optimizer for new level")
+                # Create the model lazily on the FIRST level; keep it warm thereafter.
+                if self.action_model is None:
+                    self.action_model = ActionModel(input_channels=self.num_colours, grid_size=self.grid_size).to(self.device)
+                    self.optimizer = optim.Adam(self.action_model.parameters(), lr=0.0001)
+                    print("Initialised action model")
+                else:
+                    print("Cleared experience buffer - new level reached (model kept warm)")
 
                 self.prev_frame = None
                 self.prev_action_idx = None
