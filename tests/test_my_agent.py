@@ -1,260 +1,100 @@
-"""Unit tests for agent/my_agent.py — pure perception + the BFS reset-replay search.
+"""Unit tests for agent/my_agent.py — the StochasticGoose reactive CNN agent.
 
-Run offline with numpy only (framework/SDK imports in my_agent.py are guarded).
+These exercise the framework-independent pieces: the ActionModel CNN, the
+frame→tensor encoding, the action-masking sampler, and the experience hash.
+They skip (rather than fail) when torch or the vendored framework is absent
+(i.e. before `make setup`), since the agent imports both at module load.
 """
 from __future__ import annotations
 
+import types
+
 import numpy as np
+import pytest
 
-from agent.my_agent import (
-    ReactiveNav,
-    ReplaySearch,
-    frame_signature,
-    grid_from_frame,
-    identify_status_bars,
-    priority_click_targets,
-    segment_frame,
-    status_bar_mask,
-    volatility_mask,
-)
+torch = pytest.importorskip("torch")
+
+# Importing the agent pulls in the ARC-AGI-3-Agents framework + arcengine.
+# Skip the whole module if they're not installed/vendored yet.
+try:
+    from agent.my_agent import ActionModel, MyAgent
+except Exception as exc:  # pragma: no cover - environment-dependent
+    pytest.skip(f"agent.my_agent unavailable ({exc!r})", allow_module_level=True)
 
 
-def _two_blob_grid() -> np.ndarray:
-    g = np.zeros((64, 64), dtype=np.int16)
-    g[2:5, 2:5] = 3       # 3x3, color 3 (not salient), center (3, 3)
-    g[10:18, 40:48] = 7   # 8x8, color 7 (salient), center (13, 43)
-    return g
+GRID = 64
+NUM_COLOURS = 16
+NUM_ACTION_TYPES = 5
+COMBINED = NUM_ACTION_TYPES + GRID * GRID  # 5 + 4096 = 4101
 
 
-# ───────────────────────────── perception ─────────────────────────────
-def test_segment_frame_finds_objects_and_background() -> None:
-    segs = segment_frame(_two_blob_grid())
-    assert len(segs) == 3  # background + two blobs
-    by_color = {s.color: s for s in segs}
-    assert by_color[7].area == 64 and by_color[7].bbox == (10, 40, 17, 47)
-    assert by_color[3].area == 9 and by_color[3].center == (3, 3)
+def _stub_self() -> types.SimpleNamespace:
+    """Minimal stand-in carrying only the attributes the pure methods read."""
+    return types.SimpleNamespace(
+        grid_size=GRID,
+        num_colours=NUM_COLOURS,
+        num_coordinates=GRID * GRID,
+        device=torch.device("cpu"),
+    )
 
 
-def test_priority_click_targets_salient_first_xy_and_dedup() -> None:
-    cands = priority_click_targets(_two_blob_grid(), max_targets=10)
-    assert cands[0] == (43, 13)          # salient 8x8 blob (tier 0), (x, y), floor center
-    assert (3, 3) in cands               # color-3 blob (tier 1)
-    assert len(cands) == len(set(cands))
-    assert all(0 <= x < 64 and 0 <= y < 64 for x, y in cands)
+# ───────────────────────────── ActionModel ─────────────────────────────
+def test_action_model_output_shape() -> None:
+    model = ActionModel(input_channels=NUM_COLOURS, grid_size=GRID)
+    out = model(torch.zeros(2, NUM_COLOURS, GRID, GRID))
+    assert out.shape == (2, COMBINED)  # 5 action logits + 64*64 coord logits
 
 
-def test_priority_click_targets_respects_limit() -> None:
-    g = np.zeros((64, 64), dtype=np.int16)
-    for r in range(6):
-        for c in range(5):
-            g[r * 3 : r * 3 + 2, c * 3 : c * 3 + 2] = 7  # 30 salient 2x2 blocks (area 4)
-    assert len(priority_click_targets(g, max_targets=12)) == 12
+def test_action_model_is_deterministic_in_eval() -> None:
+    model = ActionModel(input_channels=NUM_COLOURS, grid_size=GRID).eval()
+    x = torch.randn(1, NUM_COLOURS, GRID, GRID)
+    with torch.no_grad():
+        a, b = model(x), model(x)
+    assert torch.allclose(a, b)
 
 
-def test_status_bar_mask_detects_thin_edge_bar() -> None:
-    g = np.zeros((64, 64), dtype=np.int16)
-    g[0:2, 5:45] = 8  # thin horizontal bar at the top edge (aspect ratio 20)
-    g[30:34, 30:34] = 9  # a play object in the middle
-    mask = status_bar_mask(g)
-    assert mask is not None
-    assert bool(mask[0, 5]) is True     # bar masked
-    assert bool(mask[31, 31]) is False  # play object not masked
+# ─────────────────────────── frame → tensor ────────────────────────────
+def test_frame_to_tensor_onehot_shape_and_values() -> None:
+    frame = np.zeros((1, GRID, GRID), dtype=np.int64)
+    frame[0, 0, 0] = 5  # one cell of colour 5
+    fd = types.SimpleNamespace(frame=frame)
+    tensor = MyAgent._frame_to_tensor(_stub_self(), fd)
+    assert tuple(tensor.shape) == (NUM_COLOURS, GRID, GRID)
+    # one-hot: colour-5 channel hot at (0,0); colour-0 channel hot elsewhere
+    assert tensor[5, 0, 0].item() == 1.0
+    assert tensor[0, 0, 0].item() == 0.0
+    assert tensor[0, 1, 1].item() == 1.0
 
 
-def test_identify_status_bars_catches_twins() -> None:
-    g = np.zeros((64, 64), dtype=np.int16)
-    for k in range(4):  # 4 identical "life" icons along the bottom edge
-        g[62, 5 + k * 4] = 7
-    segs = segment_frame(g)
-    assert len(identify_status_bars(segs)) >= 4
+# ────────────────────────── action masking ─────────────────────────────
+def test_sampler_masks_to_only_available_simple_action() -> None:
+    np.random.seed(0)
+    logits = torch.zeros(COMBINED)
+    # Only ACTION1 available, ACTION6 (coords) not → must pick action index 0.
+    idx, coords, coord_idx, _ = MyAgent._sample_from_combined_output(
+        _stub_self(), logits, available_actions=[1]
+    )
+    assert idx == 0
+    assert coords is None
 
 
-def test_frame_signature_masks_counter() -> None:
-    g = _two_blob_grid()
-    mask = np.zeros((64, 64), dtype=bool)
-    mask[0, 0] = True
-    a, b = g.copy(), g.copy()
-    b[0, 0] = 9  # differ only in the masked cell
-    assert frame_signature(a, mask) == frame_signature(b, mask)
-    assert frame_signature(a) != frame_signature(b)
+def test_sampler_picks_coordinate_when_only_action6_available() -> None:
+    np.random.seed(0)
+    logits = torch.zeros(COMBINED)
+    idx, coords, coord_idx, _ = MyAgent._sample_from_combined_output(
+        _stub_self(), logits, available_actions=[6]
+    )
+    assert idx == 5  # coordinate/ACTION6 branch
+    assert coords is not None
+    y, x = coords
+    assert 0 <= x < GRID and 0 <= y < GRID
 
 
-def test_grid_from_frame_takes_last_grid() -> None:
-    frame = [np.zeros((64, 64), dtype=int).tolist(), _two_blob_grid().tolist()]
-    out = grid_from_frame(frame)
-    assert out.shape == (64, 64) and int(out[10, 40]) == 7
-
-
-def test_volatility_mask_isolates_counter_and_bails_on_animation() -> None:
-    grids = []
-    for t in range(6):
-        f = np.zeros((4, 4), dtype=np.int16)
-        f[0, 0] = t + 1                # counter changes every transition
-        f[3, min(t // 3, 1)] = 9       # player moves once
-        grids.append(f)
-    m = volatility_mask(grids)
-    assert m is not None and bool(m[0, 0]) and not bool(m[3, 0])
-    busy = [np.full((4, 4), t, dtype=np.int16) for t in range(5)]
-    assert volatility_mask(busy) is None
-
-
-# ───────────────────────────── ReplaySearch (BFS) ─────────────────────────────
-def run_sim(transitions, candidates, start="r", max_steps=400):
-    s = ReplaySearch()
-    cur, game_over, actions, resets = start, False, 0, 0
-    for _ in range(max_steps):
-        tok = s.step(cur, candidates.get(cur, []), game_over=game_over)
-        actions += 1
-        game_over = False
-        if tok == "RESET":
-            resets += 1
-            cur = start
-            continue
-        nxt, kind = transitions[(cur, tok)]
-        if kind == "win":
-            return True, actions, resets
-        if kind == "dead":
-            cur, game_over = nxt, True
-        else:
-            cur = nxt
-    return False, actions, resets
-
-
-def test_search_solves_a_deep_path() -> None:
-    trans = {
-        ("r", "ACTION1"): ("d", "dead"),
-        ("r", "ACTION2"): ("s1", "normal"),
-        ("s1", "ACTION1"): ("s2", "normal"),
-        ("s2", "ACTION1"): ("g", "win"),
-    }
-    cand = {"r": ["ACTION1", "ACTION2"], "s1": ["ACTION1"], "s2": ["ACTION1"], "d": []}
-    solved, actions, _ = run_sim(trans, cand)
-    assert solved and actions < 60
-
-
-def test_search_corridor_uses_no_resets() -> None:
-    trans = {("r", "ACTION1"): ("a", "normal"), ("a", "ACTION1"): ("b", "normal"),
-             ("b", "ACTION1"): ("g", "win")}
-    cand = {"r": ["ACTION1"], "a": ["ACTION1"], "b": ["ACTION1"]}
-    solved, actions, resets = run_sim(trans, cand)
-    assert solved and resets == 0 and actions == 3
-
-
-def test_search_finds_shallow_win_via_breadth() -> None:
-    # The win is the SECOND action from root; BFS must try it without diving via the first.
-    trans = {
-        ("r", "ACTION1"): ("a", "normal"),
-        ("a", "ACTION1"): ("a", "normal"),  # first action leads to a dead loop
-        ("r", "ACTION2"): ("g", "win"),
-    }
-    cand = {"r": ["ACTION1", "ACTION2"], "a": ["ACTION1"]}
-    solved, _actions, _ = run_sim(trans, cand)
-    assert solved
-
-
-def test_search_reports_unsolvable_without_crashing() -> None:
-    trans = {("r", "ACTION1"): ("r", "normal")}
-    cand = {"r": ["ACTION1"]}
-    solved, _a, _r = run_sim(trans, cand, max_steps=50)
-    assert solved is False
-
-
-def test_start_level_resets_state() -> None:
-    s = ReplaySearch()
-    s.step("r", ["ACTION1"])
-    s.start_level("root2", ["ACTION1", "ACTION2"])
-    assert s.root == "root2" and s.known == {"root2": []} and s.terminal == set()
-
-
-def test_step_modulus_keys_by_depth() -> None:
-    s = ReplaySearch(step_modulus=2)
-    s._pending_depth = 0
-    assert s._key("abc") == "abc#0"
-    s._pending_depth = 3
-    assert s._key("abc") == "abc#1"
-    assert ReplaySearch()._key("abc") == "abc"  # default (mod=1) is a no-op
-
-
-def test_dead_simple_pruning_when_enabled() -> None:
-    s = ReplaySearch(prune_dead_simples=True)
-    for _ in range(s.DEAD_AFTER):
-        s._record_simple("ACTION3", changed=False)
-    assert s._dead("ACTION3") is True            # ineffective simple is pruned
-    s._record_simple("ACTION1", changed=True)
-    assert s._dead("ACTION1") is False           # effective simple kept
-    assert s._dead("ACTION6:1,2") is False       # clicks are never globally pruned
-    assert ReplaySearch()._dead("ACTION3") is False  # default OFF (coverage-first)
-
-
-def test_search_still_solves_with_pruning_enabled() -> None:
-    # ACTION3 is a global no-op (ineffective everywhere); the win needs ACTION1 x3.
-    trans = {
-        ("r", "ACTION1"): ("a", "normal"), ("r", "ACTION3"): ("r", "normal"),
-        ("a", "ACTION1"): ("b", "normal"), ("a", "ACTION3"): ("a", "normal"),
-        ("b", "ACTION1"): ("g", "win"), ("b", "ACTION3"): ("b", "normal"),
-    }
-    cand = {k: ["ACTION1", "ACTION3"] for k in ("r", "a", "b")}
-    solved, _a, _r = run_sim(trans, cand)
-    assert solved
-
-
-# ───────────────────────────── ReactiveNav ─────────────────────────────
-def test_reactive_nav_probe_plus_semantic_fill() -> None:
-    nav = ReactiveNav()
-    root = np.zeros((8, 8), dtype=np.int16); root[2, 2] = 7
-    right = np.zeros((8, 8), dtype=np.int16); right[2, 3] = 7  # cursor moved right via ACTION4
-    up = np.zeros((8, 8), dtype=np.int16); up[1, 2] = 7        # cursor moved up via ACTION1
-    nav.probe(root, right, "ACTION4")
-    nav.probe(root, up, "ACTION1")
-    nav.finalize(["ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5"])
-    assert nav.cursor_color == 7
-    assert nav.arrow_map.get("right") == "ACTION4"   # probed
-    assert nav.arrow_map.get("up") == "ACTION1"      # probed
-    assert nav.arrow_map.get("down") == "ACTION2"    # semantic fill (blocked at root)
-    assert nav.arrow_map.get("left") == "ACTION3"    # semantic fill
-    assert nav.interact == "ACTION5"
-    assert nav.ready() is True                       # 2 confirmed moves
-
-
-def test_reactive_nav_candidate_targets_rarest_first() -> None:
-    nav = ReactiveNav()
-    nav.bg, nav.cursor_color = 0, 7
-    g = np.zeros((8, 8), dtype=np.int16)
-    g[0, 0] = 7              # cursor (excluded)
-    g[1, 1] = 9; g[2, 2] = 9  # color 9 appears twice
-    g[3, 3] = 5              # color 5 appears once (rarer)
-    cands = nav.candidate_targets(g)
-    assert cands[0] == 5 and 9 in cands
-    assert 7 not in cands and 0 not in cands
-
-
-def test_reactive_nav_plan_path_to_target_with_interact() -> None:
-    nav = ReactiveNav()
-    nav.cursor_color, nav.bg, nav.interact = 7, 0, "ACTION5"
-    nav.arrow_map = {"up": "ACTION1", "down": "ACTION2", "left": "ACTION3", "right": "ACTION4"}
-    nav.step_sizes = [2.0]  # → tile size 2, an 8x8 grid becomes a 4x4 logical grid
-    g = np.zeros((8, 8), dtype=np.int16)
-    g[0:2, 0:2] = 7          # cursor at logical (0, 0)
-    g[0:2, 6:8] = 9          # target at logical (0, 3)
-    path = nav.plan_path(g, target_color=9)
-    assert path is not None
-    assert path[-1] == "ACTION5"          # interacts on arrival
-    assert "ACTION4" in path              # moves right toward the target
-
-
-def test_reactive_nav_plan_collect_visits_all_tiles() -> None:
-    nav = ReactiveNav()
-    nav.cursor_color, nav.bg = 7, 0
-    nav.arrow_map = {"up": "ACTION1", "down": "ACTION2", "left": "ACTION3", "right": "ACTION4"}
-    nav.step_sizes = [2.0]
-    g = np.zeros((8, 8), dtype=np.int16)
-    g[0:2, 0:2] = 7   # cursor at logical (0, 0)
-    g[0:2, 4:6] = 9   # target tile at logical (0, 2)
-    g[6:8, 0:2] = 9   # target tile at logical (3, 0)
-    path = nav.plan_collect(g, target_color=9)
-    assert path is not None and len(path) >= 5   # must reach BOTH tiles, not just the nearest
-    assert all(a in ("ACTION1", "ACTION2", "ACTION3", "ACTION4") for a in path)
-
-
-def test_reactive_nav_not_ready_without_two_arrows() -> None:
-    assert ReactiveNav().ready() is False
+# ───────────────────────── experience hashing ──────────────────────────
+def test_experience_hash_is_stable_and_action_sensitive() -> None:
+    frame = np.zeros((NUM_COLOURS, GRID, GRID), dtype=bool)
+    h_a = MyAgent._compute_experience_hash(_stub_self(), frame, 3)
+    h_b = MyAgent._compute_experience_hash(_stub_self(), frame, 3)
+    h_c = MyAgent._compute_experience_hash(_stub_self(), frame, 4)
+    assert h_a == h_b          # deterministic for identical (frame, action)
+    assert h_a != h_c          # differs when the action differs

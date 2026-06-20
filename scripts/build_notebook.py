@@ -28,7 +28,7 @@ from textwrap import dedent
 #   "rtx6000"  — Nvidia RTX 6000 (g4-standard-48). ARC-AGI-3 exclusive,
 #                burns GPU quota faster — use only when you're confident.
 # ─────────────────────────────────────────────────────────────────────────────
-ACCELERATOR = "cpu"  # our hybrid (occam + symbolic) is CPU-only — no GPU needed, saves quota
+ACCELERATOR = "t4"  # StochasticGoose reactive CNN trains online — needs GPU (matches the official sample)
 
 # Internal mapping; don't edit unless Kaggle adds new options.
 _ACCELERATORS = {
@@ -40,7 +40,6 @@ _ACCELERATORS = {
 
 ROOT = Path(__file__).resolve().parents[1]
 AGENT_SRC = ROOT / "agent" / "my_agent.py"
-OCCAM_SRC = ROOT / "agent" / "occam_bundle.py"  # bundled occam solver (hybrid primary path)
 NOTEBOOK_PATH = ROOT / "notebooks" / "submission.ipynb"
 METADATA_PATH = ROOT / "notebooks" / "kernel-metadata.json"
 
@@ -63,7 +62,6 @@ def build() -> dict:
     if not AGENT_SRC.exists():
         raise SystemExit(f"Could not find {AGENT_SRC}")
     agent_body = AGENT_SRC.read_text()
-    occam_body = OCCAM_SRC.read_text() if OCCAM_SRC.exists() else ""
 
     install_cell = code_cell(
         "!pip install --no-index --find-links \\\n"
@@ -77,12 +75,6 @@ def build() -> dict:
     # and an unlucky default selection rejects the submission.
     write_agent_cell = code_cell(
         "%%writefile /tmp/my_agent.py\n" + agent_body
-    )
-
-    # occam_bundle.py ships alongside my_agent.py so the hybrid solver's primary path works
-    # offline (my_agent._run_occam loads it from next to itself).
-    write_occam_cell = code_cell(
-        "%%writefile /tmp/occam_bundle.py\n" + occam_body
     )
 
     run_cell_source = dedent(
@@ -101,10 +93,6 @@ def build() -> dict:
             # Drop our agent in as a framework template.
             !cp /tmp/my_agent.py \\
                 /kaggle/working/ARC-AGI-3-Agents/agents/templates/my_agent.py
-
-            # Ship the bundled occam solver next to it (the hybrid solver's primary path).
-            !cp /tmp/occam_bundle.py \\
-                /kaggle/working/ARC-AGI-3-Agents/agents/templates/occam_bundle.py
 
             # Register MyAgent in the framework's agent registry. We rewrite
             # __init__.py because the upstream version eagerly imports
@@ -202,7 +190,6 @@ def build() -> dict:
             ),
             install_cell,
             write_agent_cell,
-            write_occam_cell,
             run_cell,
             dummy_submission_cell,
         ],

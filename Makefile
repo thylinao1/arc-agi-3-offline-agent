@@ -1,7 +1,7 @@
 # ARC Prize 2026 — ARC-AGI-3 local dev workflow.
 #
 # Five commands cover the whole loop:
-#   make setup        # one-time: venv + arc-agi + clone framework
+#   make setup        # one-time: venv + arc-agi + torch (CPU) + clone framework
 #   make play-local   # fast inner loop: run agent/my_agent.py on a real game
 #   make pull-sample  # fetch the official Stochastic Goose sample for reference
 #   make submit       # build notebook from agent/my_agent.py + push to Kaggle
@@ -35,10 +35,12 @@ help:
 	@echo ""
 	@echo "Vars: PYTHON=$(PYTHON)  GAME=$(GAME)  STEPS=$(STEPS)"
 
-setup: ## One-time install: venv, arc-agi, kaggle CLI, clone framework
+setup: ## One-time install: venv, arc-agi, torch (CPU), kaggle CLI, clone framework
 	$(PYTHON) -m venv $(VENV)
 	$(VENV_PIP) install --upgrade pip
 	$(VENV_PIP) install "arc-agi>=0.9.6" "kaggle>=2.2" python-dotenv pandas pyarrow
+	@# The agent is a PyTorch CNN. Local dev uses CPU torch; Kaggle uses the GPU image's torch.
+	$(VENV_PIP) install torch --index-url https://download.pytorch.org/whl/cpu
 	@if [ ! -d "$(FRAMEWORK_DIR)/.git" ]; then \
 	    mkdir -p vendor && git clone --depth 1 $(FRAMEWORK_REPO) $(FRAMEWORK_DIR); \
 	else \

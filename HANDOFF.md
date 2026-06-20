@@ -3,47 +3,52 @@
 Authoritative "where things are" for a fresh conversation. Read this + `DECISION-LOG.md` first.
 
 ## TL;DR
-A **hybrid, fully-offline, deterministic ARC-AGI-3 agent** for the ARC Prize 2026 Kaggle track
-(`arc-prize-2026-arc-agi-3`, $850K, Milestone #1 = 2026-06-30). It solves **9/25 public games** — the best
-Kaggle-portable result we reached. Everything is committed, tested (21/21), and **submission-ready** (token +
-username wired, notebook built for CPU).
+A **fully-offline ARC-AGI-3 agent** for the ARC Prize 2026 Kaggle track (`arc-prize-2026-arc-agi-3`, $850K,
+Milestone #1 = 2026-06-30). The repo is **open-sourced** (public, MIT) at
+**https://github.com/thylinao1/arc-agi-3-offline-agent** (milestone eligibility locked).
 
-**As of 2026-06-19, this session:** the repo is **open-sourced** (public, MIT) at
-**https://github.com/thylinao1/arc-agi-3-offline-agent** — done before any private scores, so milestone
-eligibility is locked. The Kaggle kernel `maksimsilchenko/arc-prize-2026-arc-agi-3-starter` (v1) has been pushed
-via `make submit` and its commit run reached **COMPLETE** (valid `submission.parquet`). The ONLY remaining step is
-a **user action**: click **Submit** on the notebook to trigger Phase B (the hidden-game eval → leaderboard score).
+**⚠️ MAJOR PIVOT (2026-06-19→20).** The first submission — a hybrid reset-replay symbolic agent (occam + step-wise
+BFS) we thought solved "9/25" — scored **0.00** on the live leaderboard. Root cause: the RHAE metric
+(`min(1.15,(human/ai)²)`) is **efficiency-dominated**; reset-replay burns 10–100× human actions per level → ~0 even
+when it "solves," and occam's solves aren't even credited by the scorecard (verified: hybrid=0.0136 vs
+step-wise-only=0.1021 vs the leaderboard frontier of 0.43–1.21). **The whole "coverage-first" thesis was wrong.**
+
+**Current agent (the fix): a REACTIVE online-learning CNN** in `agent/my_agent.py`, adapted from the official
+Kaggle "Stochastic Goose" sample (Apache-2.0; the same approach scores **0.43** on the leaderboard). One action per
+step, no reset-replay → near-human action counts → real RHAE. No pretrained weights, no internet (competition-legal
+offline); trains a small CNN online per game. Runs on **GPU (Tesla T4)** on Kaggle. occam is fully removed; tests
+rewritten (6 passing, torch-gated). Notebook rebuilt for T4. **Next: resubmit and confirm a nonzero score.**
 
 ## The agent (how it plays) — `agent/my_agent.py`
-`MyAgent.main()` runs a hybrid, in priority order, all reset-replay (no internet, no LLM, no GPU):
-1. **occam** (`agent/occam_bundle.py`) — Sean Donahoe's MIT $0 solver, run with `skip_deepcopy=True`. Wins the
-   **7 movement games**: re86, m0r0, cn04, dc22, sp80, ka59, wa30.
-2. **Step-wise fallback** (if occam solves nothing) — our symbolic agent: warmup→mask→navprobe→navhypo→
-   clickscan/combosearch→BFS. Wins **2 non-movement games occam-portable misses**: vc33, lp85.
-- Net **9/25**, verified. Always offline-safe: any occam error → the step-wise fallback.
+A **reactive online-learning CNN** (adapted from the official Kaggle "Stochastic Goose" sample, Apache-2.0). It uses
+the framework's standard per-step hooks (`choose_action`/`is_done`), NOT a custom `main()`:
+1. Each 64×64 frame → one-hot 16-colour tensor. `ActionModel` (a small CNN) predicts which of ACTION1–5 and which
+   ACTION6 click coordinate is most likely to *change* the frame; selection samples those, masked to the available
+   actions.
+2. After each step it records whether the action changed the frame and trains the CNN online (per game); the model
+   resets between levels. Plays forward, resets only on game-over → action counts stay near human → real RHAE.
+- No pretrained weights, no internet, no hosted LLM (offline-legal). Self-protecting: any exception in
+  `choose_action` falls back to a random action. Runs on GPU (Tesla T4) on Kaggle.
 
-## Key findings (the real intelligence)
-- **occam's headline 17/25 does NOT transfer to Kaggle.** It relies on deepcopy-BFS, which clones the env to
-  search *for free* (clones don't consume actions). The real gateway can't be deepcopied — every probe is a
-  counted action — so the portable ceiling is **~7/25 (occam) / ~9/25 (hybrid)**. Reset-replay agents look capped
-  near here on the real (cumulative-scoring, no-free-search) competition.
-- **Scoring = cumulative RHAE** (`min(1.15,(human/ai)²)` per level, 1-indexed weighting, ~5× cutoff). Confirmed by
-  experiment: resets/exploration ARE counted → minimize-first-exposure. **No per-frame reward** (only the grid +
-  sparse `levels_completed`).
-- **Determinism CONFIRMED** (open-loop replay is safe). Human baselines tiny: vc33=[7,18,44,…], ls20=[84,96,192,…].
-- Every bounded step-wise lever (nav, pathfinding, collect-all, combo-caching, efficiency pruning) added **0**
-  public coverage on top of 3/25; coverage gains came only from running occam. Best step-wise-alone RHAE = 0.1021.
+## Key findings (why we pivoted)
+- **The metric is EFFICIENCY-dominated.** RHAE=`min(1.15,(human/ai)²)`, level-weighted. A level solved in 10–100×
+  human actions scores ≈0. **Coverage without efficiency = 0.** This invalidated the prior "coverage-first" design.
+- **The hybrid reset-replay agent scored 0.00** on the live board (rank ~1227/1303). Measured locally:
+  hybrid (occam-first)=**0.0136**, step-wise-only=**0.1021**, leaderboard frontier=**0.43–1.21**. occam's "solves"
+  are NOT credited by the scorecard (wa30 alone: occam `levels=9` → scorecard 0.0) AND occam blocked the step-wise
+  agent's efficient solves → it made the score 7.5× worse. The "9/25 coverage" was occam's internal counter, never
+  RHAE. Submission graded "Succeeded" (no crash) → 0.00 is the true RHAE.
+- **The frontier is REACTIVE agents** (one action/step, ≈human action counts). StochasticGoose (the approach we
+  adopted) = 0.43. Determinism CONFIRMED earlier; human baselines tiny: vc33=[7,18,44,…], ls20=[84,96,192,…].
 
 ## File map
 ```
-agent/my_agent.py        The agent: hybrid main() + the step-wise fallback solver (self-contained for Kaggle splice)
-agent/occam_bundle.py    occam's MIT solver, flattened to one module (GENERATED — see scripts/bundle_occam.py)
-scripts/bundle_occam.py  Regenerates occam_bundle.py from vendor/occam/solver/*.py
-scripts/build_notebook.py Builds notebooks/submission.ipynb (splices my_agent.py + occam_bundle.py); ACCELERATOR="cpu"
-scripts/play_local.py    Local runner (NORMAL mode, no key needed for the 3 anonymous games)
+agent/my_agent.py        The agent: reactive online-learning CNN (Apache-2.0; self-contained for Kaggle splice)
+scripts/build_notebook.py Builds notebooks/submission.ipynb (splices my_agent.py only); ACCELERATOR="t4" (GPU)
+scripts/play_local.py    Local runner (NORMAL mode; needs torch — `make setup` installs CPU torch)
 eval/rhae.py             RHAE scoring + coverage/variance helpers (dev)
 experiments/             determinism.py (resolved: deterministic), reset_counting.py (resolved: cumulative)
-tests/test_my_agent.py   21 unit tests (perception, ReplaySearch BFS, ReactiveNav, clickscan/combosearch)
+tests/test_my_agent.py   6 unit tests (ActionModel shape, frame→tensor, action masking, experience hash)
 SPEC.md CONTRACT.md      5-field spec + interface seams (verified against the real SDK)
 DECISION-LOG.md          Full design history + every empirical finding (append-only)
 HACKATHON-BATTLEPLAN.md  Original strategy/battle plan

@@ -7,67 +7,68 @@ running fully offline.
 ## The short version of the strategy
 
 The prize track scores agents offline, with no internet at evaluation time. That rules out anything that calls a
-hosted model like GPT or Claude. So this agent carries no model in the loop. It is a small, deterministic,
-symbolic player.
+hosted model like GPT or Claude. So this agent carries **no pretrained model and makes no network calls** — it
+learns a small CNN *online, from scratch, during play* on each game.
 
-Three facts about the scoring shape the whole design:
+The scoring metric drives the whole design. Each level scores `min(1.15, (human_actions / ai_actions)^2)`, averaged
+over the hidden games (an unsolved level is a hard zero). The square makes this **dominated by efficiency**: you
+have to solve a level in roughly a human's number of actions for it to score at all. An agent that *can* solve a
+level but takes 10–100× the actions scores ≈ 0. (We learned this the hard way — see `DECISION-LOG.md`: a
+coverage-first reset-replay agent that "solved" 9/25 games scored **0.00**, because resets and replays are counted
+and crater the action ratio.)
 
-1. **Solving more games matters most.** Score is averaged over about 110 hidden games, and a level you never solve
-   is a hard zero. So the first goal is coverage: solve as many games and levels as possible.
-2. **Being faster than a human barely helps.** The per-level score is `min(1.15, (human_actions / ai_actions)^2)`.
-   Past roughly 7% better than a human it stops paying. So the agent satisfices: find a near-human solution, then
-   stop, and spend the saved effort on the next game.
-3. **Deeper levels are worth more.** A game's score weights each level by its number, so the last level can be
-   worth six times the first. The action budget follows that weighting.
+So the agent is **reactive**: one action per step, no resetting-and-replaying to search. It learns which actions
+change the world and steers toward new states, keeping its action count close to a human's.
 
-The agent perceives each 64x64 grid as colored objects (classical connected components, no neural net), learns
-which actions change the world, and explores toward new states. When it clicks, it clicks object centers rather
-than random pixels, which collapses 4096 possible clicks down to a handful.
+## How it solves
+
+`agent/my_agent.py` is a reactive CNN agent (adapted from the official Kaggle "Stochastic Goose" sample,
+Apache-2.0 — see `NOTICE`):
+
+- Each 64×64 frame is one-hot encoded to 16 colour channels.
+- A small CNN (`ActionModel`) predicts, for the current frame, which of ACTION1–5 and which ACTION6 click
+  coordinate is most likely to *change* the frame. Action selection samples from those predictions, masked to the
+  currently available actions.
+- After every step it records whether the chosen action actually changed the frame, and trains the CNN on that
+  signal (online, per game). The model resets between levels.
+- It plays purely forward (reset only on game-over), so action counts stay near human — which is what the RHAE
+  metric rewards.
+
+This is an online-learning agent with no pretrained weights and no internet, so it is competition-legal for the
+offline prize track. It runs on a single GPU (the Kaggle submission uses a Tesla T4).
 
 ## Layout
 
 ```
-agent/my_agent.py     The agent. Self-contained (it is spliced into the Kaggle notebook).
-eval/                 RHAE scoring port + the frozen-holdout coverage/variance harness.
+agent/my_agent.py     The agent (reactive online-learning CNN). Self-contained — spliced into the Kaggle notebook.
+eval/                 RHAE scoring port + coverage/variance helpers.
 experiments/          Day-1 probes: reset-counting semantics, determinism.
-tests/                pytest unit tests for the perception and exploration helpers.
+tests/                pytest unit tests for the model + action sampling.
 scripts/, Makefile    Local dev and Kaggle submission, from the official starter.
-vendor/               Reference clones (ARC-AGI-3-Agents, Kaggle starter, occam). Gitignored.
-SPEC.md, CONTRACT.md  Scope and interface seams. DECISION-LOG.md tracks every choice.
+vendor/               Reference clones (ARC-AGI-3-Agents, Kaggle starter). Gitignored.
+SPEC.md, CONTRACT.md  Scope and interface seams. DECISION-LOG.md tracks every choice (incl. the 0.00 post-mortem).
 ```
 
 ## Run it
 
 ```bash
-make setup          # one-time: venv (Python 3.12) + arc-agi + slim the framework
-make verify-local   # 50 steps on ls20 + vc33 (no API key needed for the anonymous games)
-make play-local GAME=ls20 STEPS=200
-pytest -q           # unit tests (offline, deterministic)
+make setup          # one-time: venv (Python 3.12) + arc-agi + torch + slim the framework
+make play-local GAME=ls20 STEPS=400
+pytest -q           # unit tests (skip automatically if torch/framework absent)
 ```
 
-Online scorecards and the full game set need an API key from https://three.arcprize.org. Put it in `.env` as
-`ARC_API_KEY`. Submit to Kaggle with `make submit` (edit `notebooks/kernel-metadata.json` first).
-
-## How it solves (hybrid)
-
-`MyAgent.main()` runs a two-stage, fully-offline, deterministic solver:
-
-1. **occam** (`agent/occam_bundle.py`) — Sean Donahoe's MIT, $0, no-LLM reset-replay solver. It wins the
-   cursor/movement games (~7 of the 25 public games). Its headline 17/25 relies on deepcopy-BFS to search the
-   environment for free, which is impossible against the Kaggle gateway (every probe is a counted action), so we
-   run it with `skip_deepcopy=True` — the portable ~7/25 configuration.
-2. **Step-wise fallback** — if occam solves nothing, the built-in symbolic agent (perception → nav → goal
-   hypotheses → clickscan/combosearch → BFS) runs. It wins a couple of non-movement games occam-portable misses.
-
-Net portable coverage is about **9/25**, three times the step-wise agent alone. The agent is always offline-safe:
-any occam error falls back to the step-wise solver. The bundle is regenerated with `python scripts/bundle_occam.py`
-and shipped to Kaggle by `scripts/build_notebook.py`.
+The agent uses PyTorch; locally it runs on CPU (slow — a few games for sanity), and on Kaggle it uses the GPU.
+Online scorecards and the full game set need an API key from https://three.arcprize.org (put it in `.env` as
+`ARC_API_KEY`). Submit to Kaggle with `make submit` (the kernel is configured for a Tesla T4, internet off).
 
 ## Status
 
-Hybrid occam + step-wise agent, ~9/25 public games, fully offline and deterministic. See `DECISION-LOG.md` for the
-full design history and the finding that occam's 17/25 does not transfer to the real (no-free-search) competition.
+Reactive online-learning CNN, fully offline (no pretrained weights, no internet, no hosted LLM), GPU on Kaggle.
+The earlier reset-replay symbolic agent scored 0.00 on the live leaderboard because the metric rewards action
+efficiency, not raw coverage; this agent is the efficiency-first redirection. See `DECISION-LOG.md` for the full
+history and the leaderboard evidence.
 
 ## License
 
-MIT. See `LICENSE`. This project bundles occam (MIT, Sean Donahoe) — see `NOTICE`.
+MIT for this repository (see `LICENSE`), except `agent/my_agent.py`, which is Apache-2.0 (adapted from the official
+Kaggle Stochastic Goose sample — see `NOTICE`).

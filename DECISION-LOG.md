@@ -183,3 +183,31 @@ come from grid structure + diffing the frame at a level-complete event. NEXT, in
       `maksimsilchenko/arc-prize-2026-arc-agi-3-starter` v1 pushed; commit run reached **COMPLETE** (offline wheel
       install clean; emitted valid `submission.parquet`). Remaining step is the USER clicking **Submit** on the
       notebook to trigger Phase B (the hidden-game gateway rerun that produces the leaderboard score).
+
+- 2026-06-19 — **🔴 FIRST LEADERBOARD SCORE = 0.00 — root-caused; the coverage-first thesis was WRONG.** Investigated
+      via browser (kaggle leaderboard/logs) + local RHAE measurement. Findings:
+      1. **The metric is EFFICIENCY-dominated.** RHAE=`min(1.15,(human/ai)²)`; reset-replay (occam + our BFS) uses
+         10–100× human actions per level → ~0 RHAE even when it solves. "Coverage dominates, satisfice efficiency"
+         (the whole project premise) was backwards. Leaderboard: top 1.21; band at 0.43–0.70; **the SAME official
+         StochasticGoose notebook structure scores 0.43**; single-entry teams reach 0.01. We're 0.00, ~rank 1227.
+      2. **occam contributes ZERO and is HARMFUL.** Local scorecard: wa30 alone → occam `levels=9` but scorecard
+         **0.0**; every occam movement game = 0. occam runs first and short-circuits, blocking the step-wise agent.
+         **Measured over all 25 public games: hybrid (occam-first)=0.0136 vs step-wise-only=0.1021 → occam made it
+         7.5× WORSE.** The "9/25 coverage" was occam's internal level counter, never the scorecard RHAE.
+      3. **Submission graded "Succeeded" (no crash)** → 0.00 is the agent's true RHAE, not a rerun bug.
+      VERIFIED FIX (local): remove occam / run it last → 0.1021 (keeps symbolic agent, off zero). COMPETITIVE path:
+      the frontier is REACTIVE per-frame agents (≈human action counts); StochasticGoose (DriesSmit/ARC3-solution,
+      MIT, offline, online-trained CNN) = 0.43. Reset-replay is structurally incompatible with the RHAE metric.
+
+- 2026-06-20 — **PIVOT IMPLEMENTED: replaced the agent with the StochasticGoose reactive CNN.** User chose "go
+      competitive." Adopted the official Kaggle sample agent (`inversion/arc3-sample-submission-stochastic-goose`,
+      **Apache-2.0** — verified on the notebook page; the GitHub mirror DriesSmit/ARC3-solution is unlicensed, so we
+      attribute the Apache-2.0 Kaggle notebook). Changes: `agent/my_agent.py` ← reactive CNN (one-hot frame →
+      ActionModel CNN predicting frame-changing action/coord, online-trained per game, resets per level, forward
+      play). Removed occam entirely (`agent/occam_bundle.py`, `scripts/bundle_occam.py` deleted). `build_notebook.py`
+      → ACCELERATOR="t4" (GPU), drops the occam splice; kernel-metadata → enable_gpu + machine_shape=NvidiaTeslaT4.
+      NOTICE/README/HANDOFF updated; `make setup` installs CPU torch; tests rewritten (6 passing: model shape,
+      frame→tensor, action masking, experience hash). Local smoke test: agent runs clean via the framework loop
+      (CPU ~1 fps → GPU needed, hence T4). Notebook rebuilt (5 cells, no occam, torch+ActionModel embedded).
+      VALIDATION GAP: local CPU is too slow to confirm scoring; confidence rests on the proven sample (0.43) +
+      correct integration. Phase B on the T4 is the real test. NEXT: resubmit, confirm nonzero leaderboard score.
