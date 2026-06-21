@@ -1,23 +1,52 @@
-# HANDOFF — ARC-AGI-3 agent (state as of 2026-06-19)
+# HANDOFF — ARC-AGI-3 agent (state as of 2026-06-21)
 
-Authoritative "where things are" for a fresh conversation. Read this + `DECISION-LOG.md` first.
+Authoritative "where things are" for a fresh conversation. Read this + `DECISION-LOG.md` (+ the auto-memory) first.
 
-## TL;DR
-A **fully-offline ARC-AGI-3 agent** for the ARC Prize 2026 Kaggle track (`arc-prize-2026-arc-agi-3`, $850K,
-Milestone #1 = 2026-06-30). The repo is **open-sourced** (public, MIT) at
-**https://github.com/thylinao1/arc-agi-3-offline-agent** (milestone eligibility locked).
+## TL;DR (current)
+**Fully-offline ARC-AGI-3 agent** for ARC Prize 2026 (`arc-prize-2026-arc-agi-3`, $850K, Milestone #1 = 2026-06-30).
+Public repo (MIT): **https://github.com/thylinao1/arc-agi-3-offline-agent** (eligibility locked). Git clean + pushed
+(`270febb`). 6 tests pass.
 
-**⚠️ MAJOR PIVOT (2026-06-19→20).** The first submission — a hybrid reset-replay symbolic agent (occam + step-wise
-BFS) we thought solved "9/25" — scored **0.00** on the live leaderboard. Root cause: the RHAE metric
-(`min(1.15,(human/ai)²)`) is **efficiency-dominated**; reset-replay burns 10–100× human actions per level → ~0 even
-when it "solves," and occam's solves aren't even credited by the scorecard (verified: hybrid=0.0136 vs
-step-wise-only=0.1021 vs the leaderboard frontier of 0.43–1.21). **The whole "coverage-first" thesis was wrong.**
+**Leaderboard so far:** v1 (hybrid reset-replay) = **0.00**; v2 (reactive online CNN / StochasticGoose) = **0.08**;
+**v3 (honest imitation warm-start student) = SUBMITTED 2026-06-21 ~09:44, status PENDING** (ref 53899428) — Phase B
+running. **CHECK THE v3 SCORE FIRST:**
+`KAGGLE_API_TOKEN="$(cat .kaggle/access_token)" .venv/bin/kaggle competitions submissions arc-prize-2026-arc-agi-3 | head -4`
 
-**Current agent (the fix): a REACTIVE online-learning CNN** in `agent/my_agent.py`, adapted from the official
-Kaggle "Stochastic Goose" sample (Apache-2.0; the same approach scores **0.43** on the leaderboard). One action per
-step, no reset-replay → near-human action counts → real RHAE. No pretrained weights, no internet (competition-legal
-offline); trains a small CNN online per game. Runs on **GPU (Tesla T4)** on Kaggle. occam is fully removed; tests
-rewritten (6 passing, torch-gated). Notebook rebuilt for T4. **Next: resubmit and confirm a nonzero score.**
+**The goal is TOP-5 (> 0.66).** Honest paths explored cap well below that (online CNN ~0.25–0.32; our imitation
+data is hard-capped ~93 demos; the source-reading "BFS solvers" hit 0.42–0.46 but are a leakage exploit, likely
+prize-INELIGIBLE). >0.66 honestly needs far more/deeper demos than the offline teacher can produce (confirmed: BFS
+*and* beam/A*/MCTS all fail the same hard games; more time doesn't deepen). So v3 is a genuine, prize-eligible
+datapoint, NOT a frontier contender.
+
+**Current agent = honest imitation student** (`agent/my_agent.py`): the StochasticGoose reactive CNN, **warm-started
+from behavior-cloned weights** (`_load_pretrained` ← `/kaggle/input/arc-agi3-student-weights/student.pt`, the
+trained imitation model, 98.7% train-acc on 93 teacher demos), then learns online. Plays HONESTLY (no game-source
+access). GPU T4. Weights shipped via the Kaggle dataset `maksimsilchenko/arc-agi3-student-weights` (wired in
+kernel-metadata `dataset_sources`).
+
+## Pipeline (Track 2 — honest, prize-eligible)
+- `scripts/gen_demos.py` — genuine offline BFS teacher (in gitignored `reference/teacher_agentv15.py`) → real
+  (frame,action) demos on PUBLIC games only → `data/demos/demos.npz` (93 demos, 10 games, levels 0–1). Audit-verified
+  (solutions transfer to real env; encoding `5+y*64+x` round-trips; pre-action frames).
+- `scripts/train_student.py` — behavior cloning + color-aug; `--resume`, checkpoints every 10 epochs. Trains the
+  ActionModel; saved `models/student.pt` (gitignored, 137MB).
+- `agent/my_agent.py` `_load_pretrained` — warm-start; falls back to pure-online if no weights.
+- `scripts/build_notebook.py` — splices my_agent.py; ACCELERATOR="t4"; kernel-metadata carries the weights dataset.
+
+## NEXT STEPS (in priority order)
+1. **Read the v3 leaderboard score** (command above). If v3 > 0.08/0.25 → imitation warm-start helps; if ≈ → it
+   didn't (thin data). Either way it's the honest baseline.
+2. The ONLY honest lever toward >0.66 is **much more/deeper demos** — the offline teacher is the bottleneck (caps
+   ~10 games). Ideas not yet tried: longer per-game budgets + transfer across levels; a smarter goal-directed
+   teacher; or accept the ceiling. (Track 1 hedge: the exploit 0.46 agent in `reference/agentv15` is ready but
+   prize-risky — submit only for a LB datapoint, not the prize.)
+3. Submission limit is **2/day**; runtime 9h; GPU RTX6000/T4.
+
+## DEAD ENDS (do not repeat)
+- **occam** = FAKE solves (reports wins it never reaches; scorecard credits 0). Deleted.
+- **Coverage-first / reset-replay** = ~0 RHAE (efficiency metric). Wrong paradigm.
+- **MultiSolver (beam/A*/MCTS)** = no better coverage than plain BFS at equal time.
+- **Source-reading exploit** = 0.42–0.46 but leakage / likely prize-ineligible.
 
 ## The agent (how it plays) — `agent/my_agent.py`
 A **reactive online-learning CNN** (adapted from the official Kaggle "Stochastic Goose" sample, Apache-2.0). It uses
